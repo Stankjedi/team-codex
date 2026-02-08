@@ -1,0 +1,136 @@
+{
+  "name": "antigravity-codex-teams-viewer",
+  "displayName": "Antigravity Codex Teams Viewer",
+  "description": "View live Codex Teams tmux/TUI output in WSL from a single VS Code webview dashboard.",
+  "version": "0.1.0",
+  "publisher": "antigravity",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "codex",
+    "tmux",
+    "wsl",
+    "dashboard",
+    "multi-agent"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:agCodexTeamsViewer.sidebar",
+    "onCommand:agCodexTeamsViewer.open",
+    "onCommand:agCodexTeamsViewer.focusSidebar",
+    "onCommand:agCodexTeamsViewer.refresh",
+    "onCommand:agCodexTeamsViewer.reconfigure"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agCodexTeamsViewer.open",
+        "title": "Codex Teams Viewer: Open Dashboard"
+      },
+      {
+        "command": "agCodexTeamsViewer.focusSidebar",
+        "title": "Codex Teams Viewer: Focus Sidebar"
+      },
+      {
+        "command": "agCodexTeamsViewer.refresh",
+        "title": "Codex Teams Viewer: Refresh"
+      },
+      {
+        "command": "agCodexTeamsViewer.reconfigure",
+        "title": "Codex Teams Viewer: Configure Session"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agCodexTeamsViewer",
+          "title": "Codex Teams",
+          "icon": "media/teams.svg"
+        }
+      ]
+    },
+    "views": {
+      "agCodexTeamsViewer": [
+        {
+          "type": "webview",
+          "id": "agCodexTeamsViewer.sidebar",
+          "name": "Live Dashboard"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "agCodexTeamsViewer.refresh",
+          "when": "view == agCodexTeamsViewer.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "agCodexTeamsViewer.reconfigure",
+          "when": "view == agCodexTeamsViewer.sidebar",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Codex Teams Viewer",
+      "properties": {
+        "agCodexTeamsViewer.session": {
+          "type": "string",
+          "default": "codex-fleet",
+          "description": "tmux session name to monitor."
+        },
+        "agCodexTeamsViewer.room": {
+          "type": "string",
+          "default": "main",
+          "description": "team bus room name."
+        },
+        "agCodexTeamsViewer.repoPath": {
+          "type": "string",
+          "default": "${workspaceFolder}",
+          "description": "Repository path that contains .codex-teams. Use ${workspaceFolder} for current project."
+        },
+        "agCodexTeamsViewer.refreshMs": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 500,
+          "description": "Polling interval in milliseconds."
+        },
+        "agCodexTeamsViewer.lines": {
+          "type": "number",
+          "default": 18,
+          "minimum": 5,
+          "description": "Captured lines per tmux window pane."
+        },
+        "agCodexTeamsViewer.messages": {
+          "type": "number",
+          "default": 24,
+          "minimum": 5,
+          "description": "Recent bus messages to include in dashboard output."
+        },
+        "agCodexTeamsViewer.dashboardCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom command path for team_dashboard.sh. Leave empty to auto-detect codex-teams-dashboard."
+        },
+        "agCodexTeamsViewer.autoOpenOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically focus Codex Teams sidebar when extension activates."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "node -e \"console.log('no lint configured')\"",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.26.0"
+  }
+}

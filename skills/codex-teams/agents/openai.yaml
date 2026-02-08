@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Teams"
+  short_description: "Real-time team chat for Codex director-worker sessions"
+  default_prompt: "Use $codex-teams to run this repository task via codex-ma with a director and parallel workers that communicate through the live team bus."
