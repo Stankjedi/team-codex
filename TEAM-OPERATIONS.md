@@ -10,6 +10,12 @@
 - worker 최소 인원은 2명으로 강제
 - utility는 고정 1명
 
+## Worker Scale-Out Rule
+- 추가 워커가 필요하면 반드시 `worker-N` 워크트리를 먼저 포함한 토폴로지로 실행한다.
+- 기본 방법: `codex-teams run --workers <N>` 또는 `codex-teams run --workers auto`
+- 위 실행에서 `.worktrees/worker-1..N`과 `ma/worker-1..N` 브랜치가 자동으로 맞춰진다.
+- 세션 운영 중 증설이 필요하면, 작업을 재분배하기 전에 목표 워커 수(`N`)로 재실행해 워크트리를 동기화한다.
+
 ## Non-Execution Lead Rule
 - lead는 오케스트레이션 전용
 - 구현/테스트/커밋 직접 수행 금지

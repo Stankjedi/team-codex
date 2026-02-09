@@ -64,6 +64,7 @@ codex-teams sendmessage --session codex-fleet --type message --from lead --to wo
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
 - `--workers auto`: 태스크 난이도에 따라 `worker pool`을 2~4 범위에서 자동 선택
+- 워커 증설 원칙: 추가 워커가 필요하면 `--workers <N>`(또는 `auto`)로 재실행해 `.worktrees/worker-1..N`을 먼저 맞춘 뒤 작업을 분배
 
 기본 역할 토폴로지:
 - `lead` x 1 (오케스트레이션 전용, 실행 작업 금지)
