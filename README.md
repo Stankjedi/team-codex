@@ -25,6 +25,41 @@ codex-teams <command> [options]
 ./skills/codex-teams/scripts/install_global.sh
 ```
 
+## 스킬 빠른 등록 가이드
+
+현재 프로젝트를 Codex 스킬로 바로 등록하려면 아래 순서로 진행하면 됩니다.
+
+1. 개발용(권장, 즉시 반영) 등록
+```bash
+cd /path/to/team-codex
+./skills/codex-teams/scripts/install_global.sh --link
+```
+
+2. 배포용(복사본) 등록
+```bash
+cd /path/to/team-codex
+./skills/codex-teams/scripts/install_global.sh
+```
+
+3. PATH 확인 (`codex-teams` 명령 인식)
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+codex-teams --help
+```
+
+4. 등록 위치 확인
+- 기본 설치 경로: `~/.codex/skills/codex-teams`
+- 런처 경로: `~/.local/bin/codex-teams`
+
+5. Codex에서 스킬 명시 호출 예시
+```text
+[$codex-teams](~/.codex/skills/codex-teams/SKILL.md) 사용해서 ...
+```
+
+업데이트 반영 규칙:
+- `--link` 설치: 저장소 파일 수정 즉시 반영
+- 복사 설치: 저장소 업데이트 후 설치 스크립트를 다시 실행해야 반영
+
 ## 의존성
 
 - 필수
