@@ -17,8 +17,8 @@ Usage:
   team_control.sh [--db PATH] [--room NAME] [--repo PATH --session NAME] respond --request-id ID --approve|--reject <from> [--to RECIPIENT] [message...]
 
 Examples:
-  TEAM_DB=.codex-teams/codex-fleet/bus.sqlite team_control.sh request --type plan_approval pair-1 director "ready for review" --summary "task-04"
-  team_control.sh --repo . --session codex-fleet respond --request-id abc123 --approve director --to pair-1 "approved"
+  TEAM_DB=.codex-teams/codex-fleet/bus.sqlite team_control.sh request --type plan_approval worker-1 lead "ready for review" --summary "task-04"
+  team_control.sh --repo . --session codex-fleet respond --request-id abc123 --approve lead --to worker-1 "approved"
 EOF
 }
 

@@ -49,6 +49,16 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def role_from_agent_name(name: str, lead_name: str = "lead") -> str:
+    if name == lead_name:
+        return "lead"
+    if name.startswith("worker-"):
+        return "worker"
+    if name.startswith("utility-"):
+        return "utility"
+    return "worker"
+
+
 def run_cmd(cmd: list[str], *, cwd: str) -> tuple[int, str]:
     proc = subprocess.run(
         cmd,
@@ -205,8 +215,9 @@ def main() -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--session", required=True)
     parser.add_argument("--room", default="main")
-    parser.add_argument("--prefix", default="pair")
+    parser.add_argument("--prefix", default="worker")
     parser.add_argument("--count", type=int, required=True)
+    parser.add_argument("--agents-csv", default="")
     parser.add_argument("--worktrees-root", required=True)
     parser.add_argument("--profile", default="pair")
     parser.add_argument("--model", default="")
@@ -240,8 +251,14 @@ def main() -> int:
 
     worktrees_root = Path(args.worktrees_root).resolve()
     workers: list[WorkerState] = []
-    for i in range(1, args.count + 1):
-        name = f"{args.prefix}-{i}"
+    worker_names: list[str] = []
+    if args.agents_csv.strip():
+        worker_names = [part.strip() for part in args.agents_csv.split(",") if part.strip()]
+    else:
+        for i in range(1, args.count + 1):
+            worker_names.append(f"{args.prefix}-{i}")
+
+    for name in worker_names:
         cwd = str((worktrees_root / name).resolve())
         if not Path(cwd).is_dir():
             continue
@@ -250,7 +267,7 @@ def main() -> int:
             session=args.session,
             room=args.room,
             agent=name,
-            role="worker",
+            role=role_from_agent_name(name, lead_name=lead),
             cwd=cwd,
             profile=args.profile,
             model=args.model,

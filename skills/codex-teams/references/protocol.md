@@ -10,7 +10,7 @@
   - `.codex-teams/<session>/state.json`
   - `.codex-teams/<session>/runtime.json`
 - initializes `.codex-teams/<session>/bus.sqlite`
-- registers team members in bus (`director`, `pair-N`, `system`, `monitor`, `orchestrator`)
+- registers team members in bus (`lead`, `worker-N`, `utility-1`, `system`, `monitor`, `orchestrator`)
 
 2. `run/up`
 - selects backend:
@@ -23,17 +23,19 @@
   - otherwise => `in-process-shared`
 - `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
 - emits startup `system` and worker-scaling `status` messages
-- `--workers auto` uses adaptive pair scaling in range `2..4`
-- emits fixed workflow `status`: `scope -> delegate -> peer-qa(iterative) -> verify -> handoff`
-- default auto-delegates initial task from `director` to each `pair-N` with role-specific execution prompt
+- `--workers auto` uses adaptive worker-pool scaling in range `2..4`
+- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(iterative) -> on-demand-research-by-lead -> lead-review -> utility-push/merge`
+- lead는 orchestration-only로 유지되며 구현 태스크를 직접 수행하지 않음
+- default auto-delegates initial task from `lead` to each worker/utility agent with role-specific execution prompt
 
 3. `teamdelete`
 - removes team directory (and kills active tmux session when `--force`)
 
 ## Roles
 
-- `director`: owns planning, integration decision, final review loop
-- `pair-N`: scoped implementation workers
+- `lead`: orchestration-only, staffing/delegation/intervention owner, worker 요청 시 추가 리서치/재계획을 수행하고 요청 worker에 재전달
+- `worker-N`: implementation execution
+- `utility-1`: git/release/deploy utility owner
 - `monitor`: read-only tail of all traffic
 - `system`: lifecycle notices
 - `orchestrator`: auto-scaling/coordination notices
@@ -64,9 +66,9 @@ TeamCreate/SendMessage kinds:
 Useful commands:
 
 ```bash
-TEAM_DB=.codex-teams/<session>/bus.sqlite team_mailbox.sh --room main inbox director --unread
-team_mailbox.sh --repo . --session <session> --mode fs inbox director --unread --json
-team_mailbox.sh --repo . --session <session> --mode fs mark-read director --all
+TEAM_DB=.codex-teams/<session>/bus.sqlite team_mailbox.sh --room main inbox lead --unread
+team_mailbox.sh --repo . --session <session> --mode fs inbox lead --unread --json
+team_mailbox.sh --repo . --session <session> --mode fs mark-read lead --all
 ```
 
 ## Control Requests
@@ -89,7 +91,7 @@ team_mailbox.sh --repo . --session <session> --mode fs mark-read director --all
 ## Cadence
 
 - Worker emits `status` at start, each milestone, and handoff.
-- Director emits team-wide `status` every major plan change.
+- Lead emits team-wide `status` every major plan change.
 - Blocked worker emits `blocker` immediately.
 - Runtime automatically emits `status` events: `online`, `heartbeat`, `offline`.
 

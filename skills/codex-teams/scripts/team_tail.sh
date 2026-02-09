@@ -18,7 +18,7 @@ Usage:
   team_tail.sh [--db PATH] [--room NAME] [--since-id N] [--poll-ms N] [--all] [--json] [agent]
 
 Examples:
-  TEAM_DB=.codex-teams/bus.sqlite team_tail.sh director
+  TEAM_DB=.codex-teams/bus.sqlite team_tail.sh lead
   team_tail.sh --db /tmp/bus.sqlite --all monitor
 EOF
 }

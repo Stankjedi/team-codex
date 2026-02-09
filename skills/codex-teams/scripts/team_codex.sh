@@ -43,7 +43,7 @@ TEAM_DESCRIPTION=""
 TEAMCREATE_REPLACE="false"
 DELETE_FORCE="false"
 
-TEAM_LEAD_NAME="director"
+TEAM_LEAD_NAME="lead"
 LEAD_AGENT_TYPE="team-lead"
 TEAMMATE_MODE="auto"
 TMUX_LAYOUT="split"
@@ -69,6 +69,19 @@ MESSAGE_APPROVE=""
 AUTO_WORKERS_APPLIED="false"
 AUTO_WORKERS_REASON=""
 
+LEAD_MODEL=""
+LEAD_PROFILE=""
+UTILITY_PROFILE=""
+UTILITY_MODEL=""
+WORKER_COUNT="2"
+UTILITY_COUNT="1"
+TEAM_ROLE_SUMMARY=""
+
+declare -a TEAM_AGENT_NAMES=()
+declare -A TEAM_AGENT_ROLE=()
+declare -A TEAM_AGENT_PROFILE=()
+declare -A TEAM_AGENT_MODEL=()
+
 usage() {
   cat <<'USAGE'
 Codex Teams (filesystem mailbox + bus + tmux/in-process backends)
@@ -91,11 +104,11 @@ Common options:
   --config PATH           Config path (default: <repo>/.codex-multi-agent.config.sh)
   --room NAME             Team bus room (default: main)
   --session NAME          Session/team name override
-  --workers N|auto        Worker count override (`auto`: adaptive 2..4)
-  --director-profile NAME Director profile override
+  --workers N|auto        Worker pool size override (`auto`: adaptive 2..4)
+  --director-profile NAME Lead profile override (legacy flag name)
   --worker-profile NAME   Worker profile override
-  --model MODEL           Set both director/worker model
-  --director-model MODEL  Director model override
+  --model MODEL           Set model for all roles
+  --director-model MODEL  Lead model override (legacy flag name)
   --worker-model MODEL    Worker model override
 
 Backend options:
@@ -106,7 +119,7 @@ Backend options:
 
 run/up options:
   --task TEXT             Initial task text (required for run)
-  --auto-delegate         Auto-delegate initial task to pair workers (default)
+  --auto-delegate         Auto-delegate initial task to role agents (default)
   --no-auto-delegate      Disable automatic worker delegation
   --dashboard             Launch team-dashboard window (tmux backend)
   --dashboard-window NAME Dashboard window name
@@ -117,7 +130,7 @@ run/up options:
 teamcreate/teamdelete options:
   --team-name NAME        Team name override (default: session)
   --description TEXT      Team description
-  --lead-name NAME        Team lead name (default: director)
+  --lead-name NAME        Team lead name (default: lead)
   --agent-type TYPE       Team lead agent type (default: team-lead)
   --replace               Overwrite existing team config on teamcreate
   --force                 Force delete even with active members/session
@@ -137,8 +150,8 @@ sendmessage options:
 Examples:
   team_codex.sh run --task "Fix flaky tests" --teammate-mode tmux --tmux-layout split --dashboard
   team_codex.sh run --task "Batch maintenance" --teammate-mode in-process --no-attach
-  team_codex.sh sendmessage --type shutdown_request --from director --to pair-2 --content "stop now"
-  team_codex.sh sendmessage --type shutdown_response --from director --to pair-2 --request-id abc123 --approve --content "ok"
+  team_codex.sh sendmessage --type shutdown_request --from lead --to worker-2 --content "stop now"
+  team_codex.sh sendmessage --type shutdown_response --from lead --to worker-2 --request-id abc123 --approve --content "ok"
 USAGE
 }
 
@@ -315,18 +328,85 @@ orchestrator_pick_worker_count() {
   printf '%s|%s\n' "$picked" "$reason"
 }
 
-worker_peer_name() {
-  local idx="$1"
-  local total="$2"
-  if [[ "$total" -le 1 ]]; then
-    printf '%s\n' "$TEAM_LEAD_NAME"
-    return
+role_from_agent_name() {
+  local agent="$1"
+  case "$agent" in
+    "$TEAM_LEAD_NAME") printf '%s\n' "lead" ;;
+    utility-*) printf '%s\n' "utility" ;;
+    worker-*) printf '%s\n' "worker" ;;
+    *) printf '%s\n' "worker" ;;
+  esac
+}
+
+role_default_profile() {
+  local role="$1"
+  case "$role" in
+    lead) printf '%s\n' "$LEAD_PROFILE" ;;
+    utility) printf '%s\n' "$UTILITY_PROFILE" ;;
+    worker) printf '%s\n' "$WORKER_PROFILE" ;;
+    *) printf '%s\n' "$WORKER_PROFILE" ;;
+  esac
+}
+
+role_default_model() {
+  local role="$1"
+  case "$role" in
+    lead) printf '%s\n' "$LEAD_MODEL" ;;
+    utility) printf '%s\n' "$UTILITY_MODEL" ;;
+    worker) printf '%s\n' "$WORKER_MODEL" ;;
+    *) printf '%s\n' "$WORKER_MODEL" ;;
+  esac
+}
+
+role_peer_name() {
+  local agent="$1"
+  local role
+  role="$(role_from_agent_name "$agent")"
+  case "$role" in
+    worker) printf '%s\n' "$TEAM_LEAD_NAME" ;;
+    utility) printf '%s\n' "$TEAM_LEAD_NAME" ;;
+    *) printf '%s\n' "$TEAM_LEAD_NAME" ;;
+  esac
+}
+
+derive_role_team_shape() {
+  WORKER_COUNT="$COUNT"
+  if [[ "$WORKER_COUNT" -lt 2 ]]; then
+    WORKER_COUNT="2"
+    if [[ -n "$AUTO_WORKERS_REASON" ]]; then
+      AUTO_WORKERS_REASON="$AUTO_WORKERS_REASON,min-worker-pool"
+    else
+      AUTO_WORKERS_REASON="min-worker-pool"
+    fi
+    AUTO_WORKERS_APPLIED="true"
   fi
-  if [[ "$idx" -ge "$total" ]]; then
-    printf '%s\n' "$PREFIX-$((idx - 1))"
-    return
-  fi
-  printf '%s\n' "$PREFIX-$((idx + 1))"
+  UTILITY_COUNT="1"
+
+  TEAM_AGENT_NAMES=()
+  TEAM_AGENT_ROLE=()
+  TEAM_AGENT_PROFILE=()
+  TEAM_AGENT_MODEL=()
+
+  local i agent role
+  for i in $(seq 1 "$WORKER_COUNT"); do
+    agent="worker-$i"
+    role="worker"
+    TEAM_AGENT_NAMES+=("$agent")
+    TEAM_AGENT_ROLE["$agent"]="$role"
+    TEAM_AGENT_PROFILE["$agent"]="$(role_default_profile "$role")"
+    TEAM_AGENT_MODEL["$agent"]="$(role_default_model "$role")"
+  done
+
+  for i in $(seq 1 "$UTILITY_COUNT"); do
+    agent="utility-$i"
+    role="utility"
+    TEAM_AGENT_NAMES+=("$agent")
+    TEAM_AGENT_ROLE["$agent"]="$role"
+    TEAM_AGENT_PROFILE["$agent"]="$(role_default_profile "$role")"
+    TEAM_AGENT_MODEL["$agent"]="$(role_default_model "$role")"
+  done
+
+  TEAM_ROLE_SUMMARY="worker=$WORKER_COUNT utility=$UTILITY_COUNT"
 }
 
 fs_cmd() {
@@ -335,7 +415,7 @@ fs_cmd() {
 
 load_config_or_defaults() {
   COUNT="4"
-  PREFIX="pair"
+  PREFIX="worker"
   WORKTREES_DIR=".worktrees"
   BASE_REF="HEAD"
   USE_BASE_WIP="false"
@@ -345,8 +425,9 @@ load_config_or_defaults() {
   CODEX_BIN="codex"
   DIRECTOR_PROFILE="director"
   WORKER_PROFILE="pair"
+  LEAD_PROFILE="$DIRECTOR_PROFILE"
+  UTILITY_PROFILE="$WORKER_PROFILE"
   DIRECTOR_INPUT_DELAY="2"
-  REVIEW_MODE="director"
   MERGE_STRATEGY="merge"
   TEAMMATE_MODE="auto"
   TMUX_LAYOUT="split"
@@ -398,6 +479,13 @@ load_config_or_defaults() {
     AUTO_DELEGATE="$AUTO_DELEGATE_OVERRIDE"
   fi
 
+  if [[ -z "$LEAD_PROFILE" ]]; then
+    LEAD_PROFILE="$DIRECTOR_PROFILE"
+  fi
+  if [[ -z "$UTILITY_PROFILE" ]]; then
+    UTILITY_PROFILE="$WORKER_PROFILE"
+  fi
+
   if [[ -n "$WORKERS" ]]; then
     if [[ "$WORKERS" == "auto" ]]; then
       local orchestrator_decision
@@ -409,10 +497,10 @@ load_config_or_defaults() {
       COUNT="${orchestrator_decision%%|*}"
       AUTO_WORKERS_REASON="${orchestrator_decision#*|}"
       AUTO_WORKERS_APPLIED="true"
-    elif [[ "$WORKERS" =~ ^[0-9]+$ ]] && [[ "$WORKERS" -ge 1 ]]; then
+    elif [[ "$WORKERS" =~ ^[0-9]+$ ]] && [[ "$WORKERS" -ge 2 ]]; then
       COUNT="$WORKERS"
     else
-      abort "--workers must be an integer >= 1 or 'auto'"
+      abort "--workers must be an integer >= 2 or 'auto'"
     fi
   elif [[ "$COMMAND" == "run" && -n "$TASK" ]]; then
     local orchestrator_decision
@@ -429,17 +517,39 @@ load_config_or_defaults() {
   if [[ -n "$MODEL" ]]; then
     DIRECTOR_MODEL="$MODEL"
     WORKER_MODEL="$MODEL"
+    LEAD_MODEL="$MODEL"
+    UTILITY_MODEL="$MODEL"
+  fi
+
+  if [[ -n "$DIRECTOR_MODEL" && -z "$LEAD_MODEL" ]]; then
+    LEAD_MODEL="$DIRECTOR_MODEL"
+  fi
+  if [[ -n "$WORKER_MODEL" ]]; then
+    if [[ -z "$UTILITY_MODEL" ]]; then UTILITY_MODEL="$WORKER_MODEL"; fi
   fi
 
   if [[ -z "$DIRECTOR_MODEL" ]]; then
     DIRECTOR_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role director --profile "$DIRECTOR_PROFILE" 2>/dev/null || true)"
   fi
+  if [[ -z "$LEAD_MODEL" ]]; then
+    LEAD_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role lead --profile "$LEAD_PROFILE" 2>/dev/null || true)"
+  fi
   if [[ -z "$WORKER_MODEL" ]]; then
     WORKER_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role worker --profile "$WORKER_PROFILE" 2>/dev/null || true)"
   fi
+  if [[ -z "$UTILITY_MODEL" ]]; then
+    UTILITY_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role utility --profile "$UTILITY_PROFILE" 2>/dev/null || true)"
+  fi
 
-  if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [[ "$COUNT" -lt 1 ]]; then
-    abort "worker count must be >= 1"
+  if [[ -z "$LEAD_MODEL" ]]; then
+    LEAD_MODEL="$DIRECTOR_MODEL"
+  fi
+  if [[ -z "$UTILITY_MODEL" ]]; then
+    UTILITY_MODEL="$WORKER_MODEL"
+  fi
+
+  if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [[ "$COUNT" -lt 2 ]]; then
+    abort "worker count must be >= 2"
   fi
   if ! [[ "$DIRECTOR_INPUT_DELAY" =~ ^[0-9]+$ ]]; then
     abort "DIRECTOR_INPUT_DELAY must be an integer"
@@ -451,6 +561,8 @@ load_config_or_defaults() {
   case "$TMUX_LAYOUT" in split|window) ;; *) abort "TMUX_LAYOUT must be split|window" ;; esac
   case "$PLAN_MODE_REQUIRED" in true|false) ;; *) abort "PLAN_MODE_REQUIRED must be true|false" ;; esac
   case "$AUTO_DELEGATE" in true|false) ;; *) abort "AUTO_DELEGATE must be true|false" ;; esac
+
+  derive_role_team_shape
 
   TEAM_ROOT="$REPO/.codex-teams/$TMUX_SESSION"
   TEAM_CONFIG="$TEAM_ROOT/config.json"
@@ -524,10 +636,8 @@ register_team_members() {
   local name
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    local role="worker"
-    if [[ "$name" == "$TEAM_LEAD_NAME" ]]; then
-      role="director"
-    fi
+    local role
+    role="$(role_from_agent_name "$name")"
     python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$name" --role "$role" >/dev/null
   done < <(fs_member_names)
 }
@@ -549,7 +659,7 @@ create_or_refresh_team_context() {
     --description "$TEAM_DESCRIPTION" \
     --agent-type "$LEAD_AGENT_TYPE" \
     --lead-name "$TEAM_LEAD_NAME" \
-    --model "$DIRECTOR_MODEL" \
+    --model "$LEAD_MODEL" \
     --cwd "$REPO" \
     "${replace_arg[@]}" >/dev/null
 
@@ -558,16 +668,25 @@ create_or_refresh_team_context() {
     worker_backend="tmux"
   fi
 
-  for i in $(seq 1 "$COUNT"); do
-    local worker="$PREFIX-$i"
+  local worker
+  for worker in "${TEAM_AGENT_NAMES[@]}"; do
     local wt_path="$WORKTREES_ROOT/$worker"
+    local role="${TEAM_AGENT_ROLE[$worker]}"
+    local model="${TEAM_AGENT_MODEL[$worker]}"
+    local profile="${TEAM_AGENT_PROFILE[$worker]}"
+    if [[ -z "$model" ]]; then
+      model="$WORKER_MODEL"
+    fi
+    if [[ -z "$profile" ]]; then
+      profile="$WORKER_PROFILE"
+    fi
     local args=(
       member-add
       --repo "$REPO"
       --session "$TMUX_SESSION"
       --name "$worker"
-      --agent-type "worker"
-      --model "$WORKER_MODEL"
+      --agent-type "$role"
+      --model "$model"
       --prompt ""
       --cwd "$wt_path"
       --backend-type "$worker_backend"
@@ -583,7 +702,7 @@ create_or_refresh_team_context() {
   register_team_members
 
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
-    --body "team_created name=$team_name session=$TMUX_SESSION workers=$COUNT mode=$RESOLVED_BACKEND layout=$TMUX_LAYOUT" >/dev/null
+    --body "team_created name=$team_name session=$TMUX_SESSION roles=[$TEAM_ROLE_SUMMARY] members=${#TEAM_AGENT_NAMES[@]} mode=$RESOLVED_BACKEND layout=$TMUX_LAYOUT" >/dev/null
 }
 
 ensure_worktrees() {
@@ -605,15 +724,15 @@ ensure_worktrees() {
     if [[ -z "$wip_hash" ]]; then
       abort "failed to create WIP snapshot for worktrees"
     fi
-    local wip_ref="refs/codex/wip/${PREFIX}-$(date +%Y%m%d-%H%M%S)"
+    local wip_ref="refs/codex/wip/team-$(date +%Y%m%d-%H%M%S)"
     git -C "$REPO" update-ref "$wip_ref" "$wip_hash"
     base_commit="$wip_hash"
   else
     base_commit="$(git -C "$REPO" rev-parse --verify "${BASE_REF}^{commit}")"
   fi
 
-  for i in $(seq 1 "$COUNT"); do
-    local name="$PREFIX-$i"
+  local name
+  for name in "${TEAM_AGENT_NAMES[@]}"; do
     local branch="ma/$name"
     local wt_path="$WORKTREES_ROOT/$name"
 
@@ -648,10 +767,7 @@ REPO_PATH="$REPO"
 SESSION_NAME="$TMUX_SESSION"
 DIRECTOR_PROFILE_VALUE="$DIRECTOR_PROFILE"
 WORKER_PROFILE_VALUE="$WORKER_PROFILE"
-WORKER_PREFIX_VALUE="$PREFIX"
 TEAM_LEAD_NAME_VALUE="$TEAM_LEAD_NAME"
-DIRECTOR_MODEL_VALUE="$DIRECTOR_MODEL"
-WORKER_MODEL_VALUE="$WORKER_MODEL"
 DEFAULT_MODEL_VALUE="$MODEL"
 CODEX_BIN_VALUE="$CODEX_BIN"
 PERMISSION_MODE_VALUE="$PERMISSION_MODE"
@@ -684,13 +800,13 @@ fi
 if [[ -z "\$agent_name" ]]; then
   base_name="\$(basename "\$agent_cwd")"
   if [[ "\$role_profile" == "\$DIRECTOR_PROFILE_VALUE" ]]; then
-    agent_name="director"
-    agent_role="director"
+    agent_name="\$TEAM_LEAD_NAME_VALUE"
+    agent_role="lead"
   elif [[ "\$role_profile" == "\$WORKER_PROFILE_VALUE" ]]; then
-    if [[ "\$base_name" =~ ^\${WORKER_PREFIX_VALUE}-[0-9]+$ ]]; then
+    if [[ "\$base_name" =~ ^(worker|utility)-[0-9]+$ ]]; then
       agent_name="\$base_name"
     else
-      agent_name="\${WORKER_PREFIX_VALUE}-worker"
+      agent_name="worker-agent"
     fi
     agent_role="worker"
   else
@@ -709,10 +825,8 @@ python3 "\$FS_SCRIPT" runtime-mark --repo "\$REPO_PATH" --session "\$SESSION_NAM
 notify_status "online backend=tmux permission_mode=\$PERMISSION_MODE_VALUE profile=\${role_profile:-default} cwd=\$agent_cwd pid=\$\$"
 
 cmd=("\$CODEX_BIN_VALUE")
-if [[ "\$role_profile" == "\$DIRECTOR_PROFILE_VALUE" && -n "\$DIRECTOR_MODEL_VALUE" ]]; then
-  cmd+=(-m "\$DIRECTOR_MODEL_VALUE")
-elif [[ "\$role_profile" == "\$WORKER_PROFILE_VALUE" && -n "\$WORKER_MODEL_VALUE" ]]; then
-  cmd+=(-m "\$WORKER_MODEL_VALUE")
+if [[ -n "\${CODEX_TEAM_MODEL:-}" ]]; then
+  cmd+=(-m "\$CODEX_TEAM_MODEL")
 elif [[ -n "\$DEFAULT_MODEL_VALUE" ]]; then
   cmd+=(-m "\$DEFAULT_MODEL_VALUE")
 fi
@@ -734,8 +848,9 @@ make_pane_command() {
   local role="$2"
   local profile="$3"
   local cwd="$4"
+  local model="${5:-}"
   local cmd
-  printf -v cmd 'CODEX_TEAM_AGENT=%q CODEX_TEAM_ROLE=%q %q -p %q -C %q' "$agent" "$role" "$WRAPPER" "$profile" "$cwd"
+  printf -v cmd 'CODEX_TEAM_AGENT=%q CODEX_TEAM_ROLE=%q CODEX_TEAM_MODEL=%q %q -p %q -C %q' "$agent" "$role" "$model" "$WRAPPER" "$profile" "$cwd"
   printf '%s\n' "$cmd"
 }
 
@@ -776,16 +891,19 @@ launch_tmux_split_backend() {
 
   tmux select-pane -t "$TMUX_SESSION:$SWARM_WINDOW.0" -T "$TEAM_LEAD_NAME"
   local director_cmd
-  director_cmd="$(make_pane_command "$TEAM_LEAD_NAME" "director" "$DIRECTOR_PROFILE" "$REPO")"
+  director_cmd="$(make_pane_command "$TEAM_LEAD_NAME" "lead" "$LEAD_PROFILE" "$REPO" "$LEAD_MODEL")"
   tmux send-keys -t "$TMUX_SESSION:$SWARM_WINDOW.0" "$director_cmd" C-m
   local lead_pane
   lead_pane="$(tmux display-message -p -t "$TMUX_SESSION:$SWARM_WINDOW.0" '#{pane_id}')"
   record_tmux_runtime "$TEAM_LEAD_NAME" "$lead_pane" "$SWARM_WINDOW"
   set_tmux_pane_color "$TMUX_SESSION:$SWARM_WINDOW.0" "$TEAM_LEAD_NAME"
 
-  for i in $(seq 1 "$COUNT"); do
-    local agent="$PREFIX-$i"
+  local agent
+  for agent in "${TEAM_AGENT_NAMES[@]}"; do
     local wt_path="$WORKTREES_ROOT/$agent"
+    local role="${TEAM_AGENT_ROLE[$agent]}"
+    local profile="${TEAM_AGENT_PROFILE[$agent]}"
+    local model="${TEAM_AGENT_MODEL[$agent]}"
     if [[ ! -d "$wt_path" ]]; then
       echo "skip missing worktree: $wt_path" >&2
       continue
@@ -796,7 +914,7 @@ launch_tmux_split_backend() {
     tmux select-pane -t "$pane_id" -T "$agent"
 
     local worker_cmd
-    worker_cmd="$(make_pane_command "$agent" "worker" "$WORKER_PROFILE" "$wt_path")"
+    worker_cmd="$(make_pane_command "$agent" "$role" "$profile" "$wt_path" "$model")"
     tmux send-keys -t "$pane_id" "$worker_cmd" C-m
 
     record_tmux_runtime "$agent" "$pane_id" "$SWARM_WINDOW"
@@ -824,7 +942,7 @@ launch_tmux_window_backend() {
 
   tmux new-session -d -s "$TMUX_SESSION" -n "$TEAM_LEAD_NAME" -c "$REPO"
   local lead_cmd
-  lead_cmd="$(make_pane_command "$TEAM_LEAD_NAME" "director" "$DIRECTOR_PROFILE" "$REPO")"
+  lead_cmd="$(make_pane_command "$TEAM_LEAD_NAME" "lead" "$LEAD_PROFILE" "$REPO" "$LEAD_MODEL")"
   tmux send-keys -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" "$lead_cmd" C-m
   local lead_pane
   lead_pane="$(tmux display-message -p -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" '#{pane_id}')"
@@ -832,16 +950,19 @@ launch_tmux_window_backend() {
   tmux select-pane -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" -T "$TEAM_LEAD_NAME"
   set_tmux_pane_color "$TMUX_SESSION:$TEAM_LEAD_NAME.0" "$TEAM_LEAD_NAME"
 
-  for i in $(seq 1 "$COUNT"); do
-    local agent="$PREFIX-$i"
+  local agent
+  for agent in "${TEAM_AGENT_NAMES[@]}"; do
     local wt_path="$WORKTREES_ROOT/$agent"
+    local role="${TEAM_AGENT_ROLE[$agent]}"
+    local profile="${TEAM_AGENT_PROFILE[$agent]}"
+    local model="${TEAM_AGENT_MODEL[$agent]}"
     if [[ ! -d "$wt_path" ]]; then
       echo "skip missing worktree: $wt_path" >&2
       continue
     fi
     tmux new-window -t "$TMUX_SESSION" -n "$agent" -c "$wt_path"
     local worker_cmd
-    worker_cmd="$(make_pane_command "$agent" "worker" "$WORKER_PROFILE" "$wt_path")"
+    worker_cmd="$(make_pane_command "$agent" "$role" "$profile" "$wt_path" "$model")"
     tmux send-keys -t "$TMUX_SESSION:$agent.0" "$worker_cmd" C-m
     local pane_id
     pane_id="$(tmux display-message -p -t "$TMUX_SESSION:$agent.0" '#{pane_id}')"
@@ -859,9 +980,12 @@ spawn_inprocess_backend() {
 
   fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$TEAM_LEAD_NAME" --backend in-process --status idle --pid 0 --window in-process >/dev/null
 
-  for i in $(seq 1 "$COUNT"); do
-    local agent="$PREFIX-$i"
+  local agent
+  for agent in "${TEAM_AGENT_NAMES[@]}"; do
     local wt_path="$WORKTREES_ROOT/$agent"
+    local role="${TEAM_AGENT_ROLE[$agent]}"
+    local profile="${TEAM_AGENT_PROFILE[$agent]}"
+    local model="${TEAM_AGENT_MODEL[$agent]}"
     if [[ ! -d "$wt_path" ]]; then
       echo "skip missing worktree: $wt_path" >&2
       continue
@@ -874,10 +998,10 @@ spawn_inprocess_backend() {
       --session "$TMUX_SESSION"
       --room "$ROOM"
       --agent "$agent"
-      --role worker
+      --role "$role"
       --cwd "$wt_path"
-      --profile "$WORKER_PROFILE"
-      --model "$WORKER_MODEL"
+      --profile "$profile"
+      --model "$model"
       --codex-bin "$CODEX_BIN"
       --permission-mode "$PERMISSION_MODE"
     )
@@ -889,7 +1013,7 @@ spawn_inprocess_backend() {
     local pid=$!
 
     fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --backend in-process --status running --pid "$pid" --window in-process >/dev/null
-    python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role worker >/dev/null
+    python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role "$role" >/dev/null
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status --body "spawned in-process agent=$agent pid=$pid log=$log_file" >/dev/null
   done
 }
@@ -901,6 +1025,8 @@ spawn_inprocess_shared_backend() {
   fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$TEAM_LEAD_NAME" --backend in-process-shared --status idle --pid 0 --window in-process-shared >/dev/null
 
   local hub_log="$LOG_DIR/inprocess-hub.log"
+  local agents_csv
+  agents_csv="$(IFS=,; echo "${TEAM_AGENT_NAMES[*]}")"
   local args=(
     python3 "$INPROCESS_HUB"
     --repo "$REPO"
@@ -908,6 +1034,7 @@ spawn_inprocess_shared_backend() {
     --room "$ROOM"
     --prefix "$PREFIX"
     --count "$COUNT"
+    --agents-csv "$agents_csv"
     --worktrees-root "$WORKTREES_ROOT"
     --profile "$WORKER_PROFILE"
     --model "$WORKER_MODEL"
@@ -922,7 +1049,7 @@ spawn_inprocess_shared_backend() {
   local pid=$!
 
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
-    --body "spawned in-process shared hub pid=$pid workers=$COUNT log=$hub_log" >/dev/null
+    --body "spawned in-process shared hub pid=$pid members=${#TEAM_AGENT_NAMES[@]} roles=[$TEAM_ROLE_SUMMARY] log=$hub_log" >/dev/null
 }
 
 launch_aux_windows() {
@@ -955,38 +1082,53 @@ launch_aux_windows() {
     tmux new-window -t "$TMUX_SESSION" -n "$PULSE_WINDOW" -c "$REPO"
   fi
   tmux select-pane -t "$TMUX_SESSION:$PULSE_WINDOW.0" -T "pulse" >/dev/null 2>&1 || true
+  local pulse_agents
+  pulse_agents="$(IFS=,; echo "${TEAM_AGENT_NAMES[*]}")"
   tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" \
-    "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --prefix '$PREFIX' --count '$COUNT' --lead-name '$TEAM_LEAD_NAME'" C-m
+    "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --agents-csv '$pulse_agents' --lead-name '$TEAM_LEAD_NAME'" C-m
 }
 
-worker_focus_instruction() {
-  local idx="$1"
-  local total="$2"
-  local focus="implement and validate your assigned slice"
-  case "$total:$idx" in
-    *:1) focus="analyze scope, list risks, and produce a concrete execution plan" ;;
-    2:2) focus="implement code changes and run focused verification" ;;
-    3:2) focus="implement code changes and keep commit-level notes" ;;
-    3:3) focus="write/execute tests and report regressions or gaps" ;;
-    4:2) focus="implement backend/core changes with minimal blast radius" ;;
-    4:3) focus="implement frontend/integration changes and edge-case handling" ;;
-    4:4) focus="verify tests/lint, review diffs, and flag blockers early" ;;
+role_primary_objective() {
+  local role="$1"
+  case "$role" in
+    worker)
+      printf '%s\n' "Implement scoped code changes with minimal blast radius and provide concrete validation output."
+      ;;
+    utility)
+      printf '%s\n' "Own git/release operations: integrate approved changes, push branch, and execute merge flow with traceable logs."
+      ;;
+    *)
+      printf '%s\n' "Execute assigned scope and provide auditable evidence."
+      ;;
   esac
-  printf '%s\n' "$focus"
 }
 
-build_worker_task_prompt() {
+build_role_task_prompt() {
   local agent="$1"
-  local idx="$2"
-  local total="$3"
-  local user_task="$4"
+  local role="$2"
+  local idx="$3"
+  local total="$4"
+  local user_task="$5"
   local peer
-  peer="$(worker_peer_name "$idx" "$total")"
+  peer="$(role_peer_name "$agent")"
   local focus
-  focus="$(worker_focus_instruction "$idx" "$total")"
+  focus="$(role_primary_objective "$role")"
+  local role_specific_contract=""
+  if [[ "$role" == "worker" ]]; then
+    role_specific_contract="$(cat <<EOF
+7. If anything is unknown mid-task, ask lead immediately with \`question\`; do not guess critical requirements.
+8. If you request additional research/planning, lead must run it and send you a refined plan/task update before major implementation continues.
+EOF
+)"
+  elif [[ "$role" == "utility" ]]; then
+    role_specific_contract="$(cat <<EOF
+7. If release/merge context is unclear, ask lead and wait for explicit handoff approval.
+EOF
+)"
+  fi
   cat <<EOF
 [Codex Teams]
-team=$TMUX_SESSION lead=$TEAM_LEAD_NAME worker=$agent role_index=$idx/$total
+team=$TMUX_SESSION lead=$TEAM_LEAD_NAME agent=$agent role=$role index=$idx/$total
 peer_collaboration_target=$peer
 
 Primary objective:
@@ -996,17 +1138,20 @@ User request:
 $user_task
 
 Execution contract:
-1. Start immediately and keep changes scoped to your assigned slice.
-2. Send progress/completion/blocker updates through:
-   codex-teams sendmessage --session "$TMUX_SESSION" --room "$ROOM" --type message --from "$agent" --to "$TEAM_LEAD_NAME" --summary "<progress|done|blocker>" --content "<update>"
-3. Realtime collaboration is mandatory: whenever requirements, API contracts, or integration points are unclear, ask $peer immediately and continue question/answer exchanges until resolved.
-4. Include evidence in your done update: changed files + validation command result + remaining risk.
+1. Start immediately and keep changes scoped to your role responsibility.
+2. Lead($TEAM_LEAD_NAME) owns research/planning/review orchestration and must not execute implementation tasks. Escalate blockers/questions to lead.
+3. Realtime collaboration is mandatory: when interfaces/requirements are unclear, ask $peer with \`question\` and continue iterative Q/A until closed.
+4. Send progress and completion updates:
+   codex-teams sendmessage --session "$TMUX_SESSION" --room "$ROOM" --type status --from "$agent" --to "$TEAM_LEAD_NAME" --summary "<progress|done|blocker>" --content "<update>"
+5. Include evidence in done: changed files + validation command outputs + residual risk.
+6. Utility handoff: once lead approves completion, utility handles git push and merge flow.
+$role_specific_contract
 EOF
 }
 
 announce_collaboration_workflow() {
   local workflow_summary
-  workflow_summary="workflow-fixed scope->delegate->peer-qa->verify->handoff; policy=adaptive-workers-2..4"
+  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(iterative)->on-demand-research-by-lead->lead-review->utility-push/merge; lead=orchestration-only; role-shape=[$TEAM_ROLE_SUMMARY]; policy=adaptive-worker-pool-2..4"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status --body "$workflow_summary" >/dev/null
   fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from orchestrator --recipient all --summary "workflow-fixed" --content "$workflow_summary" >/dev/null || true
 }
@@ -1023,13 +1168,17 @@ tmux_send_worker_task() {
   tmux send-keys -t "$pane" C-m
 }
 
-delegate_initial_task_to_workers() {
+delegate_initial_task_to_role_agents() {
   local task_text="$1"
-  for i in $(seq 1 "$COUNT"); do
-    local agent="$PREFIX-$i"
+  local i=0
+  local total="${#TEAM_AGENT_NAMES[@]}"
+  local agent
+  for agent in "${TEAM_AGENT_NAMES[@]}"; do
+    i=$((i + 1))
+    local role="${TEAM_AGENT_ROLE[$agent]}"
     local delegated
-    delegated="$(build_worker_task_prompt "$agent" "$i" "$COUNT" "$task_text")"
-    fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from "$TEAM_LEAD_NAME" --recipient "$agent" --content "$delegated" --summary "delegated-initial-task-$i" >/dev/null
+    delegated="$(build_role_task_prompt "$agent" "$role" "$i" "$total" "$task_text")"
+    fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from "$TEAM_LEAD_NAME" --recipient "$agent" --content "$delegated" --summary "delegated-initial-task-$agent" >/dev/null
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from "$TEAM_LEAD_NAME" --to "$agent" --kind task --body "$delegated" >/dev/null
     if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
       tmux_send_worker_task "$agent" "$delegated" || true
@@ -1042,22 +1191,41 @@ inject_initial_task() {
     return 0
   fi
 
-  python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to "$TEAM_LEAD_NAME" --kind task --body "$TASK" >/dev/null
-  fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from system --recipient "$TEAM_LEAD_NAME" --content "$TASK" --summary "initial-task" >/dev/null
+  local orchestration_note
+  orchestration_note="lead-orchestration-only task_received=true auto_delegate=$AUTO_DELEGATE roles=[$TEAM_ROLE_SUMMARY]"
+  python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to "$TEAM_LEAD_NAME" --kind status --body "$orchestration_note" >/dev/null
+  fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from system --recipient "$TEAM_LEAD_NAME" --content "$orchestration_note" --summary "initial-orchestration" >/dev/null
 
+  local lead_task_prompt
+  lead_task_prompt="$(cat <<EOF
+[Lead Mission]
+You are the lead orchestrator for team=$TMUX_SESSION.
+
+User request:
+$TASK
+
+Operating policy:
+1. Perform requirement analysis and research synthesis.
+2. Produce a concrete execution plan.
+3. Adjust worker allocation within configured worker pool.
+4. Delegate implementation tasks to worker-* agents.
+5. Coordinate in real time, intervene on blockers, and perform final review.
+6. Handoff approved changes to utility-1 for git push and merge workflow.
+7. If a worker requests additional research/planning mid-task, perform it immediately and send refined guidance back to that worker as a follow-up task/status.
+
+Hard constraint:
+- Do not implement code directly; lead is orchestration-only.
+EOF
+)"
+  python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to "$TEAM_LEAD_NAME" --kind task --body "$lead_task_prompt" >/dev/null
+  fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from system --recipient "$TEAM_LEAD_NAME" --content "$lead_task_prompt" --summary "lead-mission" >/dev/null
   if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
     sleep "$DIRECTOR_INPUT_DELAY"
-    if [[ "$TMUX_LAYOUT" == "split" ]]; then
-      tmux send-keys -t "$TMUX_SESSION:$SWARM_WINDOW.0" -l -- "$TASK"
-      tmux send-keys -t "$TMUX_SESSION:$SWARM_WINDOW.0" C-m
-    else
-      tmux send-keys -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" -l -- "$TASK"
-      tmux send-keys -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" C-m
-    fi
+    tmux_send_worker_task "$TEAM_LEAD_NAME" "$lead_task_prompt" || true
   fi
 
   if [[ "$AUTO_DELEGATE" == "true" ]]; then
-    delegate_initial_task_to_workers "$TASK"
+    delegate_initial_task_to_role_agents "$TASK"
   fi
 }
 
@@ -1069,7 +1237,8 @@ print_start_summary() {
   if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
     echo "- tmux layout: $TMUX_LAYOUT"
   fi
-  echo "- workers: $COUNT"
+  echo "- role members: ${#TEAM_AGENT_NAMES[@]} ($TEAM_ROLE_SUMMARY)"
+  echo "- worker pool: $WORKER_COUNT"
   if [[ "$AUTO_WORKERS_APPLIED" == "true" ]]; then
     echo "- worker scaling: auto ($AUTO_WORKERS_REASON)"
   fi
@@ -1079,8 +1248,8 @@ print_start_summary() {
   echo "- team config: $TEAM_CONFIG"
   echo "- state: $TEAM_ROOT/state.json"
   echo "- viewer bridge: $REPO/$VIEWER_BRIDGE_FILE"
-  if [[ -n "$DIRECTOR_MODEL" || -n "$WORKER_MODEL" ]]; then
-    echo "- models: director=${DIRECTOR_MODEL:-<default>} worker=${WORKER_MODEL:-<default>}"
+  if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" || -n "$UTILITY_MODEL" ]]; then
+    echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>} utility=${UTILITY_MODEL:-<default>}"
   fi
   if [[ "$RESOLVED_BACKEND" == "in-process" ]]; then
     echo "- logs: $LOG_DIR/<agent>.log"
@@ -1125,10 +1294,10 @@ run_swarm() {
   write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
 
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
-    --body "session=$TMUX_SESSION started via codex-teams backend=$RESOLVED_BACKEND workers=$COUNT layout=$TMUX_LAYOUT permission_mode=$PERMISSION_MODE" >/dev/null
+    --body "session=$TMUX_SESSION started via codex-teams backend=$RESOLVED_BACKEND members=${#TEAM_AGENT_NAMES[@]} role_shape=[$TEAM_ROLE_SUMMARY] layout=$TMUX_LAYOUT permission_mode=$PERMISSION_MODE" >/dev/null
   if [[ "$AUTO_WORKERS_APPLIED" == "true" ]]; then
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status \
-      --body "auto-worker-scaling selected pairs=$COUNT reason=$AUTO_WORKERS_REASON" >/dev/null
+      --body "auto-worker-scaling selected worker_pool=$WORKER_COUNT role_shape=[$TEAM_ROLE_SUMMARY] reason=$AUTO_WORKERS_REASON" >/dev/null
   fi
   announce_collaboration_workflow
 
@@ -1496,7 +1665,7 @@ PY
         if [[ -n "$req_sender" ]]; then
           recipient="$req_sender"
         else
-          recipient="director"
+          recipient="$TEAM_LEAD_NAME"
         fi
       fi
 

@@ -3,9 +3,13 @@
 
 Resolution order (highest first):
 1) role-specific override: [codex_teams] <role>_model
-2) profile model: [profiles.<profile>] model
-3) codex_teams default: [codex_teams] model
+2) profile model: [profiles.<profile>].model
+3) codex_teams default: [codex_teams].model
 4) top-level model
+
+Supported roles:
+- director, lead
+- worker, utility
 
 Project config (.codex/config.toml) overrides user config (~/.codex/config.toml).
 """
@@ -62,7 +66,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Resolve Codex model from config files")
     parser.add_argument("--project-root", default=os.getcwd(), help="project root for .codex/config.toml")
     parser.add_argument("--profile", default=None)
-    parser.add_argument("--role", choices=["director", "worker"], default=None)
+    parser.add_argument(
+        "--role",
+        choices=["director", "lead", "worker", "utility"],
+        default=None,
+    )
     parser.add_argument("--print-source", action="store_true", help="print source file with model")
     args = parser.parse_args()
 

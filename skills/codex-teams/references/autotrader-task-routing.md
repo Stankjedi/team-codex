@@ -8,7 +8,7 @@ Use this when the user provides the staged AutoTrader plan and asks for fast par
 - Worker-1: Task 00 (pnpm monorepo scaffold)
 - Worker-2: Task 01 (Electron + React + security defaults)
 - Worker-3: Task 03 (`services/core` HTTP + WS contracts)
-- Director: guardrails (`AGENTS.md`, `.codex/config.toml`), review integration order
+- Lead: guardrails (`AGENTS.md`, `.codex/config.toml`), review integration order
 
 ### Wave 2 (Desktop/Core Link)
 - Worker-1: Task 02 (Binance-like layout skeleton)
@@ -28,15 +28,15 @@ Use this when the user provides the staged AutoTrader plan and asks for fast par
 ### Wave 5 (Automation + Packaging)
 - Worker-1: Task 11 (fill-time note enhancement + audit log)
 - Worker-2: Task 12 (desktop packaging + core child-process lifecycle)
-- Director: final integration, safety review, and runbook verification
+- Lead: final integration, safety review, and runbook verification
 
 ## Bus Message Examples
 
-### Director Assignment
-`TEAM_DB=.codex-teams/bus.sqlite ./scripts/team_send.sh --kind task director worker-2 "Own Task 04: WS reconnect + Logs tab rendering + tests"`
+### Lead Assignment
+`TEAM_DB=.codex-teams/bus.sqlite ./scripts/team_send.sh --kind task lead worker-2 "Own Task 04: WS reconnect + Logs tab rendering + tests"`
 
 ### Worker Blocker
-`TEAM_DB=.codex-teams/bus.sqlite ./scripts/team_send.sh --kind blocker worker-2 director "Need shared event schema change in packages/shared before decode test can pass"`
+`TEAM_DB=.codex-teams/bus.sqlite ./scripts/team_send.sh --kind blocker worker-2 lead "Need shared event schema change in packages/shared before decode test can pass"`
 
 ### Handoff
-`TEAM_DB=.codex-teams/bus.sqlite ./scripts/team_send.sh --kind status worker-1 director "done: Task05 engine+sqlite; evidence: pnpm --filter core test; risk: mock feed volatility tuning"`
+`TEAM_DB=.codex-teams/bus.sqlite ./scripts/team_send.sh --kind status worker-1 lead "done: Task05 engine+sqlite; evidence: pnpm --filter core test; risk: mock feed volatility tuning"`

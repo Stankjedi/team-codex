@@ -1,0 +1,18 @@
+# Codex Teams model allocation (Lead + Worker + Utility)
+
+model = "gpt-5.3-codex"
+
+[codex_teams]
+model = "gpt-5.3-codex"
+lead_model = "gpt-5.3-codex"
+worker_model = "gpt-5.3-codex"
+utility_model = "gpt-5.3-codex"
+
+[profiles.director]
+model = "gpt-5.3-codex"
+
+[profiles.pair]
+model = "gpt-5.3-codex"
+
+[profiles.utility]
+model = "gpt-5.3-codex"

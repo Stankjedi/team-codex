@@ -24,8 +24,8 @@ Commands:
   pending <agent> [--all-status] [--json] [--limit N]
 
 Examples:
-  TEAM_DB=.codex-teams/codex-fleet/bus.sqlite team_mailbox.sh inbox director --unread
-  team_mailbox.sh --repo . --session codex-fleet --mode fs inbox director --unread
+  TEAM_DB=.codex-teams/codex-fleet/bus.sqlite team_mailbox.sh inbox lead --unread
+  team_mailbox.sh --repo . --session codex-fleet --mode fs inbox lead --unread
 EOF
 }
 

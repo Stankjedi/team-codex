@@ -14,8 +14,8 @@ Usage:
   team_send.sh [--db PATH] [--room NAME] [--kind KIND] <from> <to> <message...>
 
 Examples:
-  TEAM_DB=.codex-teams/bus.sqlite team_send.sh director worker-1 "Split task A/B"
-  team_send.sh --db /tmp/bus.sqlite --kind blocker worker-2 director "Tests failing on ws schema"
+  TEAM_DB=.codex-teams/bus.sqlite team_send.sh lead worker-1 "Split task A/B"
+  team_send.sh --db /tmp/bus.sqlite --kind blocker worker-2 lead "Tests failing on ws schema"
 EOF
 }
 

@@ -8,9 +8,10 @@ DB="${TEAM_DB:-}"
 SESSION="codex-fleet"
 WINDOW="swarm"
 ROOM="main"
-PREFIX="pair"
+PREFIX="worker"
 COUNT="4"
-LEAD_NAME="director"
+LEAD_NAME="lead"
+AGENTS_CSV=""
 LINES="20"
 INTERVAL="8"
 MIN_GAP="45"
@@ -27,9 +28,10 @@ Options:
   --session NAME    tmux session name (default: codex-fleet)
   --window NAME     tmux window name to watch (default: swarm)
   --room NAME       bus room (default: main)
-  --prefix NAME     worker pane prefix (default: pair)
+  --prefix NAME     worker pane prefix (default: worker)
   --count N         worker count ceiling (default: 4)
-  --lead-name NAME  leader pane title/name (default: director)
+  --lead-name NAME  leader pane title/name (default: lead)
+  --agents-csv CSV  explicit agent names to monitor (e.g. worker-1,utility-1)
   --lines N         pane lines sampled for hash (default: 20)
   --interval SEC    polling interval (default: 8)
   --min-gap SEC     min seconds between emits per agent (default: 45)
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --lead-name)
       LEAD_NAME="$2"
+      shift 2
+      ;;
+    --agents-csv)
+      AGENTS_CSV="$2"
       shift 2
       ;;
     --lines)
@@ -112,6 +118,16 @@ if ! [[ "$MIN_GAP" =~ ^[0-9]+$ ]] || [[ "$MIN_GAP" -lt 1 ]]; then
   exit 2
 fi
 
+declare -A AGENT_ALLOWLIST
+if [[ -n "$AGENTS_CSV" ]]; then
+  IFS=',' read -r -a __agents <<<"$AGENTS_CSV"
+  for raw in "${__agents[@]}"; do
+    agent="$(printf '%s' "$raw" | xargs)"
+    [[ -z "$agent" ]] && continue
+    AGENT_ALLOWLIST["$agent"]=1
+  done
+fi
+
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required" >&2
   exit 2
@@ -124,6 +140,14 @@ fi
 
 agent_from_title() {
   local title="$1"
+  if [[ -n "$AGENTS_CSV" ]]; then
+    if [[ -n "${AGENT_ALLOWLIST[$title]:-}" ]]; then
+      printf '%s\n' "$title"
+      return 0
+    fi
+    return 1
+  fi
+
   if [[ "$title" == "$LEAD_NAME" ]]; then
     printf '%s\n' "$LEAD_NAME"
     return 0
@@ -142,7 +166,9 @@ touch_agent() {
   local agent="$1"
   local role="worker"
   if [[ "$agent" == "$LEAD_NAME" ]]; then
-    role="director"
+    role="lead"
+  elif [[ "$agent" == utility-* ]]; then
+    role="utility"
   fi
   python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role "$role" >/dev/null 2>&1 || true
 }
