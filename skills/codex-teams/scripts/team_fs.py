@@ -239,6 +239,41 @@ def ensure_inbox(p: FsPaths, agent: str) -> None:
         write_json(ip, {"agent": agent, "messages": []})
 
 
+def clear_runtime_artifacts(p: FsPaths) -> None:
+    if p.inboxes.exists():
+        for child in p.inboxes.iterdir():
+            if child.is_file():
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+
+    if p.tasks.exists():
+        for child in p.tasks.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+
+    logs_dir = p.root / "logs"
+    if logs_dir.exists():
+        for child in logs_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+
+    write_runtime(p, {"agents": {}})
+    write_state(p, deep_copy(DEFAULT_STATE))
+    write_control(p, {"requests": {}})
+
+
 def read_mailbox(p: FsPaths, agent: str) -> list[dict[str, Any]]:
     ensure_inbox(p, agent)
     box = read_json(inbox_path(p, agent), {"agent": agent, "messages": []})
@@ -777,6 +812,8 @@ def cmd_team_create(args: argparse.Namespace) -> int:
     if p.config.exists() and not args.replace:
         cfg = read_json(p.config, {})
         raise SystemExit(f'Already leading team "{cfg.get("name", "unknown")}"')
+    if args.replace:
+        clear_runtime_artifacts(p)
 
     cfg = create_team_config(
         team_name=args.team_name,

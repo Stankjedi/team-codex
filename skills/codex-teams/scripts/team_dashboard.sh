@@ -244,62 +244,6 @@ render_tmux_panes() {
   done < <(tmux list-windows -t "$SESSION" -F "#{window_name}")
 }
 
-render_inprocess_agents() {
-  local runtime_file="$REPO/.codex-teams/$SESSION/runtime.json"
-  local log_dir="$REPO/.codex-teams/$SESSION/logs"
-
-  if [[ ! -f "$runtime_file" ]]; then
-    echo "(no runtime state: $runtime_file)"
-    return 0
-  fi
-
-  local entries
-  entries="$(python3 - "$runtime_file" <<'PY'
-import json
-import sys
-
-runtime_path = sys.argv[1]
-try:
-    with open(runtime_path, "r", encoding="utf-8") as f:
-        runtime = json.load(f)
-except Exception:
-    raise SystemExit(0)
-
-agents = runtime.get("agents", {})
-if not isinstance(agents, dict):
-    raise SystemExit(0)
-
-for name in sorted(agents.keys()):
-    rec = agents.get(name, {})
-    if not isinstance(rec, dict):
-        continue
-    if str(rec.get("backend", "")) not in {"in-process", "in-process-shared"}:
-        continue
-    status = str(rec.get("status", ""))
-    pid = str(rec.get("pid", 0))
-    print(f"{name}|{status}|{pid}")
-PY
-)"
-
-  if [[ -z "$entries" ]]; then
-    echo "(no in-process teammates)"
-    return 0
-  fi
-
-  while IFS='|' read -r agent status pid; do
-    [[ -z "$agent" ]] && continue
-    echo ""
-    render_section_header "$agent"
-    echo "backend=in-process status=$status pid=$pid"
-    local log_file="$log_dir/$agent.log"
-    if [[ -f "$log_file" ]]; then
-      tail -n "$LINES" "$log_file"
-    else
-      echo "(log missing: $log_file)"
-    fi
-  done <<< "$entries"
-}
-
 render_fs_unread_mailbox() {
   local config_file="$REPO/.codex-teams/$SESSION/config.json"
   local inbox_root="$REPO/.codex-teams/$SESSION/inboxes"
@@ -459,15 +403,11 @@ while true; do
     echo ""
     render_section_header "tmux"
     if [[ "$TMUX_INSTALLED" == "true" ]]; then
-      echo "session not found: $SESSION (in-process backend may be running without tmux panes)"
+      echo "session not found: $SESSION"
     else
       echo "tmux not installed; showing bus/runtime data only"
     fi
   fi
-
-  echo ""
-  render_section_header "in-process teammates"
-  render_inprocess_agents
 
   if [[ "$ONCE" == "true" ]]; then
     break

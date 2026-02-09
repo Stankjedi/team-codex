@@ -5,7 +5,7 @@ description: Launch and operate Codex multi-agent sessions with real-time inter-
 
 # Codex Teams
 
-Codex CLI + tmux/in-process + SQLite bus + filesystem mailbox 기반 멀티 에이전트 스킬.
+Codex CLI + tmux + SQLite bus + filesystem mailbox 기반 멀티 에이전트 스킬.
 
 ## Quick Start
 
@@ -24,9 +24,9 @@ codex-teams setup --repo <repo>
 codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo task force"
 ```
 
-4. Run swarm with Codex CLI panes:
+4. Run swarm with Codex CLI panes (single-mode tmux):
 ```bash
-codex-teams run --task "<user task>" --session codex-fleet --workers auto --teammate-mode tmux --tmux-layout split --dashboard
+codex-teams run --task "<user task>" --session codex-fleet --workers auto --tmux-layout split --dashboard
 ```
 
 Git binary override example (utility push/merge path):
@@ -34,38 +34,26 @@ Git binary override example (utility push/merge path):
 codex-teams run --task "<user task>" --session codex-fleet --git-bin "/mnt/c/Program Files/Git/cmd/git.exe"
 ```
 
-5. Or run in-process teammates:
-```bash
-codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process --no-attach
-```
-
-Or run shared in-process hub (single supervisor process):
-```bash
-codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process-shared --no-attach
-```
-
-6. Monitor bus directly:
+5. Monitor bus directly:
 ```bash
 TEAM_DB=.codex-teams/codex-fleet/bus.sqlite ./scripts/team_tail.sh --all monitor
 ```
 
-7. Open unified terminal dashboard:
+6. Open unified terminal dashboard:
 ```bash
 codex-teams-dashboard --session codex-fleet --repo <repo> --room main
 ```
 
-8. Send team message (`SendMessage` equivalent):
+7. Send team message (`SendMessage` equivalent):
 ```bash
 codex-teams sendmessage --session codex-fleet --type message --from lead --to worker-1 --content "Own reconnect logic"
 ```
 
 ## Runtime Layout
 
-`codex-teams run/up` modes:
-- `--teammate-mode auto`: `tmux` 명령이 있으면 `tmux` 우선, 없으면 `in-process-shared`
-- `--teammate-mode tmux`: tmux 세션에 lead + worker/utility 패널 생성
-- `--teammate-mode in-process`: 파일 mailbox 폴링 루프 기반 워커 실행
-- `--teammate-mode in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행
+`codex-teams run/up` runtime:
+- 백엔드는 `tmux` 단일 모드로 고정
+- `--teammate-mode`는 호환성 플래그이며 `auto|tmux`만 허용, `auto`는 `tmux`로 정규화
 - 작업 디렉터리 규칙: `lead`는 루트 레포, `worker/utility`는 `.worktrees/<agent>`
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
@@ -142,8 +130,6 @@ Model precedence (highest first):
 - `scripts/team_control.sh`: plan/shutdown/permission request-response helper
 - `scripts/team_dashboard.sh`: single-terminal live dashboard (all tmux panes)
 - `scripts/team_pulse.sh`: automatic heartbeat from pane content changes
-- `scripts/team_inprocess_agent.py`: in-process teammate poll/execute loop
-- `scripts/team_inprocess_hub.py`: shared in-process multi-worker hub loop
 - `scripts/install_global.sh`: global install + launchers
 
 ## IDE / Terminal Usage

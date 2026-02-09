@@ -20,13 +20,9 @@
 
 2. `run/up`
 - selects backend:
-  - `auto`
   - `tmux` (`--tmux-layout split|window`)
-  - `in-process` (filesystem mailbox poll loop)
-  - `in-process-shared` (single-process hub running multiple teammate loops)
-- `auto` backend policy:
-  - tmux available => `tmux`
-  - otherwise => `in-process-shared`
+  - `--teammate-mode auto` is accepted and normalized to `tmux`
+- `tmux` is required for `run/up` in current single-mode policy
 - `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
 - emits startup `system` and worker-scaling `status` messages
 - `--workers auto` uses adaptive worker-pool scaling in range `2..4`
