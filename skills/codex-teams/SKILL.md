@@ -57,7 +57,7 @@ codex-teams sendmessage --session codex-fleet --type message --from lead --to wo
 ## Runtime Layout
 
 `codex-teams run/up` modes:
-- `--teammate-mode auto`: 대화형+tmux 가능 시 `tmux`, 그 외 `in-process-shared` 자동 선택
+- `--teammate-mode auto`: `tmux` 명령이 있으면 `tmux` 우선, 없으면 `in-process-shared`
 - `--teammate-mode tmux`: tmux 세션에 lead + worker/utility 패널 생성
 - `--teammate-mode in-process`: 파일 mailbox 폴링 루프 기반 워커 실행
 - `--teammate-mode in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행

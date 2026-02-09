@@ -623,10 +623,8 @@ load_config_or_defaults() {
   if [[ "$RESOLVED_BACKEND" == "auto" ]]; then
     if [[ -n "${TMUX:-}" ]]; then
       RESOLVED_BACKEND="tmux"
-    elif [[ -t 0 && -t 1 ]] && command -v tmux >/dev/null 2>&1; then
+    elif command -v tmux >/dev/null 2>&1; then
       RESOLVED_BACKEND="tmux"
-    elif [[ ! -t 0 || ! -t 1 ]]; then
-      RESOLVED_BACKEND="in-process-shared"
     else
       RESOLVED_BACKEND="in-process-shared"
     fi

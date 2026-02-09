@@ -40,6 +40,26 @@ Codex 멀티 에이전트 협업 스킬(`codex-teams`) 저장소입니다.
 codex-teams <command> [options]
 ```
 
+## 실행 전 필수 조건 (Git 저장소)
+
+`codex-teams run/up`을 사용하려면 대상 경로가 아래 조건을 만족해야 합니다.
+
+- `git init`이 된 Git 저장소여야 함
+- 최소 1개 커밋이 존재해야 함 (`HEAD`가 유효해야 워크트리 기준 커밋 계산 가능)
+
+초기 커밋이 없는 상태(unborn branch)에서 실행하면 다음과 같이 실패할 수 있습니다.
+
+```text
+fatal: Needed a single revision
+```
+
+최소 해결 예시:
+
+```bash
+git add README.md
+git commit -m "chore: initial commit"
+```
+
 ## 설치
 
 ```bash
@@ -162,7 +182,7 @@ codex-teams run --session codex-fleet --task "작업 내용" --teammate-mode in-
 codex-teams run --session codex-fleet --task "작업 내용" --no-auto-delegate
 ```
 
-- `auto`: 대화형 터미널 + `tmux` 사용 가능 시 `tmux`, 그 외에는 `in-process-shared` 선택
+- `auto`: `tmux` 명령이 있으면 `tmux` 우선, 없으면 `in-process-shared` 선택
 - `tmux`: 같은 TUI에서 `lead + worker-N + utility-1` 분할/창 실행
 - `in-process`: 파일 메일박스 폴링 루프 기반 워커 프로세스 실행
 - `in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행

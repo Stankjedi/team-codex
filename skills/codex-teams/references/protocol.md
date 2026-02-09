@@ -19,7 +19,7 @@
   - `in-process` (filesystem mailbox poll loop)
   - `in-process-shared` (single-process hub running multiple teammate loops)
 - `auto` backend policy:
-  - interactive + tmux available => `tmux`
+  - tmux available => `tmux`
   - otherwise => `in-process-shared`
 - `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
 - emits startup `system` and worker-scaling `status` messages
