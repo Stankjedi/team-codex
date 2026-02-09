@@ -2,6 +2,12 @@
 
 ## Team Lifecycle
 
+0. `setup`
+- prepares repo prerequisites for `run/up`:
+  - initializes git repo when missing
+  - creates initial commit when missing
+  - ensures local git identity fallback for bootstrap commit
+
 1. `teamcreate`
 - creates `.codex-teams/<session>/config.json` and legacy `.codex-teams/<session>/team.json`
 - creates filesystem inbox/state/runtime artifacts:

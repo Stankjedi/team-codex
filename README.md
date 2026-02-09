@@ -56,9 +56,13 @@ fatal: Needed a single revision
 최소 해결 예시:
 
 ```bash
-git add README.md
-git commit -m "chore: initial commit"
+codex-teams setup --repo .
 ```
+
+`setup`은 아래를 자동으로 수행합니다.
+- Git 저장소가 없으면 `git init` 수행
+- 초기 커밋이 없으면 초기 커밋 생성
+- Git 작성자 정보가 없으면 로컬 저장소에 기본값 설정
 
 ## 설치
 
@@ -155,6 +159,14 @@ git config --global credential.helper '!"/mnt/c/Program Files/Git/mingw64/bin/gi
 
 ## 핵심 기능
 
+### 0) Setup (필수)
+
+```bash
+codex-teams setup --repo .
+```
+
+`run/up` 전에 한 번 실행해 Git/초기 커밋 전제조건을 보장합니다.
+
 ### 1) TeamCreate / TeamDelete
 
 ```bash
@@ -186,6 +198,7 @@ codex-teams run --session codex-fleet --task "작업 내용" --no-auto-delegate
 - `tmux`: 같은 TUI에서 `lead + worker-N + utility-1` 분할/창 실행
 - `in-process`: 파일 메일박스 폴링 루프 기반 워커 프로세스 실행
 - `in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행
+- 작업 디렉터리 규칙: `lead`는 루트 레포에서 실행, `worker/utility`는 `.worktrees/<agent>`에서 실행
 - `--workers auto`: 작업 난이도 기준으로 `worker pool`을 **2~4명 범위에서 능동적으로 스폰**
 - 기본값으로 초기 태스크를 워커별 하위 태스크로 자동 분할(`--auto-delegate`), 필요 시 `--no-auto-delegate`로 비활성화
 

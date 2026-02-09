@@ -94,6 +94,7 @@ Usage:
 
 Commands:
   init                    Initialize codex-ma compatible project config
+  setup                   Prepare repository (git init + initial commit) for codex-teams
   run                     TeamCreate + spawn teammates + inject task
   up                      Same as run without task injection
   status                  Show runtime/team/bus/tmux status
@@ -152,6 +153,7 @@ sendmessage options:
   --reject                Mark response as rejected
 
 Examples:
+  team_codex.sh setup --repo .
   team_codex.sh run --task "Fix flaky tests" --teammate-mode tmux --tmux-layout split --dashboard
   team_codex.sh run --task "Batch maintenance" --teammate-mode in-process --no-attach
   team_codex.sh sendmessage --type shutdown_request --from lead --to worker-2 --content "stop now"
@@ -231,6 +233,54 @@ git_repo_cmd() {
   local repo_for_git
   repo_for_git="$(repo_path_for_git_bin "$GIT_BIN" "$repo_path")"
   "$GIT_BIN" -C "$repo_for_git" "$@"
+}
+
+repo_has_non_git_entries() {
+  local repo_path="$1"
+  python3 - "$repo_path" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+for name in os.listdir(root):
+    if name == ".git":
+        continue
+    print("true")
+    raise SystemExit(0)
+print("false")
+PY
+}
+
+ensure_git_identity_for_repo() {
+  local git_bin="$1"
+  local repo_path="$2"
+  local repo_for_git
+  repo_for_git="$(repo_path_for_git_bin "$git_bin" "$repo_path")"
+
+  local name
+  local email
+  name="$("$git_bin" -C "$repo_for_git" config user.name 2>/dev/null || true)"
+  email="$("$git_bin" -C "$repo_for_git" config user.email 2>/dev/null || true)"
+
+  if [[ -z "$name" ]]; then
+    name="${CODEX_TEAM_GIT_USER_NAME:-Codex Teams}"
+    "$git_bin" -C "$repo_for_git" config user.name "$name"
+  fi
+  if [[ -z "$email" ]]; then
+    email="${CODEX_TEAM_GIT_USER_EMAIL:-codex-teams@local}"
+    "$git_bin" -C "$repo_for_git" config user.email "$email"
+  fi
+}
+
+require_repo_ready_for_run() {
+  local repo_for_git
+  repo_for_git="$(repo_path_for_git_bin "$GIT_BIN" "$REPO")"
+  if ! "$GIT_BIN" -C "$repo_for_git" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    abort "not a git repository: $REPO (run: codex-teams setup --repo \"$REPO\")"
+  fi
+  if ! "$GIT_BIN" -C "$repo_for_git" rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
+    abort "repository has no commit for base ref '$BASE_REF'. run: codex-teams setup --repo \"$REPO\""
+  fi
 }
 
 abs_path_from() {
@@ -1313,6 +1363,7 @@ run_swarm() {
   require_cmd "$GIT_BIN"
   require_cmd python3
   require_cmd "$CODEX_BIN"
+  require_repo_ready_for_run
 
   if [[ "$COMMAND" == "run" && -z "$TASK" ]]; then
     abort "--task is required for run"
@@ -1455,6 +1506,52 @@ cmd_teamcreate() {
   echo "- bus: $DB"
   echo "- state: $TEAM_ROOT/state.json"
   echo "- viewer bridge: $REPO/$VIEWER_BRIDGE_FILE"
+}
+
+cmd_setup() {
+  local git_bin="$BOOT_GIT_BIN"
+  require_cmd "$git_bin"
+
+  local repo_for_git
+  repo_for_git="$(repo_path_for_git_bin "$git_bin" "$REPO")"
+
+  if ! "$git_bin" -C "$repo_for_git" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! "$git_bin" -C "$repo_for_git" init -b main >/dev/null 2>&1; then
+      "$git_bin" -C "$repo_for_git" init >/dev/null
+      "$git_bin" -C "$repo_for_git" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1 || true
+    fi
+  fi
+
+  local repo_resolved
+  repo_resolved="$("$git_bin" -C "$repo_for_git" rev-parse --show-toplevel)"
+  REPO="$(repo_path_from_git_bin "$git_bin" "$repo_resolved")"
+  repo_for_git="$(repo_path_for_git_bin "$git_bin" "$REPO")"
+
+  ensure_git_identity_for_repo "$git_bin" "$REPO"
+
+  if ! "$git_bin" -C "$repo_for_git" rev-parse --verify HEAD^{commit} >/dev/null 2>&1; then
+    local has_entries
+    has_entries="$(repo_has_non_git_entries "$REPO")"
+    if [[ "$has_entries" == "false" ]]; then
+      cat > "$REPO/README.md" <<'EOF'
+# Repository Bootstrap
+
+Initialized by codex-teams setup.
+EOF
+    fi
+    "$git_bin" -C "$repo_for_git" add -A
+    if "$git_bin" -C "$repo_for_git" diff --cached --quiet; then
+      abort "setup could not create initial commit; no files to commit in $REPO"
+    fi
+    "$git_bin" -C "$repo_for_git" commit -m "chore: bootstrap repository for codex-teams" >/dev/null
+  fi
+
+  local head
+  head="$("$git_bin" -C "$repo_for_git" rev-parse --short HEAD)"
+  echo "setup complete"
+  echo "- repo: $REPO"
+  echo "- git: $git_bin"
+  echo "- head: $head"
 }
 
 cmd_teamdelete() {
@@ -1752,7 +1849,7 @@ parse_args() {
   shift
 
   case "$COMMAND" in
-    init|run|up|status|merge|teamcreate|teamdelete|sendmessage) ;;
+    init|setup|run|up|status|merge|teamcreate|teamdelete|sendmessage) ;;
     -h|--help)
       usage
       exit 0
@@ -1960,14 +2057,16 @@ parse_args() {
   done
 
   REPO="$(cd "$REPO" && pwd)"
-  local repo_for_boot_git
-  repo_for_boot_git="$(repo_path_for_git_bin "$BOOT_GIT_BIN" "$REPO")"
-  if ! "$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    abort "not a git repository: $REPO"
+  if [[ "$COMMAND" != "setup" ]]; then
+    local repo_for_boot_git
+    repo_for_boot_git="$(repo_path_for_git_bin "$BOOT_GIT_BIN" "$REPO")"
+    if ! "$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      abort "not a git repository: $REPO (run: codex-teams setup --repo \"$REPO\")"
+    fi
+    local repo_resolved
+    repo_resolved="$("$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --show-toplevel)"
+    REPO="$(repo_path_from_git_bin "$BOOT_GIT_BIN" "$repo_resolved")"
   fi
-  local repo_resolved
-  repo_resolved="$("$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --show-toplevel)"
-  REPO="$(repo_path_from_git_bin "$BOOT_GIT_BIN" "$repo_resolved")"
 
   if [[ -z "$CONFIG" ]]; then
     CONFIG="$REPO/.codex-multi-agent.config.sh"
@@ -1989,7 +2088,7 @@ main() {
   parse_args "$@"
 
   case "$COMMAND" in
-    teamcreate|teamdelete|sendmessage|run|up|status)
+    setup|teamcreate|teamdelete|sendmessage|run|up|status)
       require_teams_enabled
       ;;
     *)
@@ -1999,6 +2098,10 @@ main() {
   case "$COMMAND" in
     init)
       exec "$LEGACY_SCRIPT" init --repo "$REPO"
+      ;;
+
+    setup)
+      cmd_setup
       ;;
 
     merge)

@@ -14,12 +14,17 @@ Codex CLI + tmux/in-process + SQLite bus + filesystem mailbox 기반 멀티 에�
 ./scripts/install_global.sh
 ```
 
-2. Create team context (`TeamCreate` equivalent):
+2. Run setup on target repository (required before first `run/up`):
+```bash
+codex-teams setup --repo <repo>
+```
+
+3. Create team context (`TeamCreate` equivalent):
 ```bash
 codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo task force"
 ```
 
-3. Run swarm with Codex CLI panes:
+4. Run swarm with Codex CLI panes:
 ```bash
 codex-teams run --task "<user task>" --session codex-fleet --workers auto --teammate-mode tmux --tmux-layout split --dashboard
 ```
@@ -29,7 +34,7 @@ Git binary override example (utility push/merge path):
 codex-teams run --task "<user task>" --session codex-fleet --git-bin "/mnt/c/Program Files/Git/cmd/git.exe"
 ```
 
-4. Or run in-process teammates:
+5. Or run in-process teammates:
 ```bash
 codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process --no-attach
 ```
@@ -39,17 +44,17 @@ Or run shared in-process hub (single supervisor process):
 codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process-shared --no-attach
 ```
 
-5. Monitor bus directly:
+6. Monitor bus directly:
 ```bash
 TEAM_DB=.codex-teams/codex-fleet/bus.sqlite ./scripts/team_tail.sh --all monitor
 ```
 
-6. Open unified terminal dashboard:
+7. Open unified terminal dashboard:
 ```bash
 codex-teams-dashboard --session codex-fleet --repo <repo> --room main
 ```
 
-7. Send team message (`SendMessage` equivalent):
+8. Send team message (`SendMessage` equivalent):
 ```bash
 codex-teams sendmessage --session codex-fleet --type message --from lead --to worker-1 --content "Own reconnect logic"
 ```
@@ -61,6 +66,7 @@ codex-teams sendmessage --session codex-fleet --type message --from lead --to wo
 - `--teammate-mode tmux`: tmux 세션에 lead + worker/utility 패널 생성
 - `--teammate-mode in-process`: 파일 mailbox 폴링 루프 기반 워커 실행
 - `--teammate-mode in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행
+- 작업 디렉터리 규칙: `lead`는 루트 레포, `worker/utility`는 `.worktrees/<agent>`
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
 - `--workers auto`: 태스크 난이도에 따라 `worker pool`을 2~4 범위에서 자동 선택
@@ -128,7 +134,7 @@ Model precedence (highest first):
 
 ## Scripts
 
-- `scripts/team_codex.sh`: main entrypoint (`run/up/status/merge/teamcreate/teamdelete/sendmessage`)
+- `scripts/team_codex.sh`: main entrypoint (`setup/run/up/status/merge/teamcreate/teamdelete/sendmessage`)
 - `scripts/team_codex_ma.sh`: legacy codex-ma backend bridge
 - `scripts/team_bus.py`: SQLite bus (`init`, `send`, `tail`, `status`, mailbox/control)
 - `scripts/team_fs.py`: filesystem team config/mailbox/state/runtime core
