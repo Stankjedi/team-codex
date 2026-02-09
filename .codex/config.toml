@@ -10,9 +10,12 @@ utility_model = "gpt-5.3-codex"
 
 [profiles.director]
 model = "gpt-5.3-codex"
+model_reasoning_effort = "xhigh"
 
 [profiles.pair]
 model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
 
 [profiles.utility]
 model = "gpt-5.3-codex"
+model_reasoning_effort = "high"

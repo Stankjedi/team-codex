@@ -1,0 +1,10 @@
+# Local runtime artifacts
+.codex-teams/
+.worktrees/
+
+# Local machine overrides
+.codex-multi-agent.config.sh
+.codex-multi-agent.allowdirty.config.sh
+
+# Local instructions file (workspace-private)
+AGENTS.md
