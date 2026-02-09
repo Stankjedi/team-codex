@@ -659,6 +659,8 @@ def create_team_config(
     lead_cwd: str,
     lead_session_id: str,
     parent_session_id: str,
+    lead_backend_type: str,
+    lead_mode: str,
 ) -> dict[str, Any]:
     ts = now_ms()
     safe_team = sanitize_team_name(team_name)
@@ -684,8 +686,8 @@ def create_team_config(
                 "tmuxPaneId": "",
                 "cwd": lead_cwd,
                 "subscriptions": [],
-                "backendType": "tmux",
-                "mode": "auto",
+                "backendType": lead_backend_type,
+                "mode": lead_mode,
             }
         ],
         "hiddenPaneIds": [],
@@ -824,6 +826,8 @@ def cmd_team_create(args: argparse.Namespace) -> int:
         lead_cwd=str(Path(args.cwd).resolve()),
         lead_session_id=args.lead_session_id or str(uuid.uuid4()),
         parent_session_id=args.parent_session_id or str(uuid.uuid4()),
+        lead_backend_type=args.backend_type,
+        lead_mode=args.mode,
     )
     write_config(p, cfg)
     write_control(p, {"requests": {}, "updatedAt": now_ms()})
@@ -1310,6 +1314,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", default=os.getcwd())
     p.add_argument("--lead-session-id", default="")
     p.add_argument("--parent-session-id", default="")
+    p.add_argument("--backend-type", default="tmux")
+    p.add_argument("--mode", default="auto")
     p.add_argument("--replace", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_team_create)

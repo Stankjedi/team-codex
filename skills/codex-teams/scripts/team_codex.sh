@@ -11,8 +11,12 @@ MODEL_RESOLVER="$SCRIPT_DIR/resolve_model.py"
 DASHBOARD_SCRIPT="$SCRIPT_DIR/team_dashboard.sh"
 PULSE_SCRIPT="$SCRIPT_DIR/team_pulse.sh"
 TAIL_SCRIPT="$SCRIPT_DIR/team_tail.sh"
+INPROCESS_AGENT="$SCRIPT_DIR/team_inprocess_agent.py"
+INPROCESS_HUB="$SCRIPT_DIR/team_inprocess_hub.py"
+TMUX_MAILBOX_BRIDGE="$SCRIPT_DIR/team_tmux_mailbox_bridge.py"
 LEGACY_SCRIPT="$SCRIPT_DIR/team_codex_ma.sh"
 VIEWER_BRIDGE_FILE=".codex-teams/.viewer-session.json"
+WINDOWS_GIT_EXE_PATH="/mnt/c/Program Files/Git/cmd/git.exe"
 
 COMMAND=""
 REPO="$(pwd)"
@@ -26,6 +30,7 @@ DASHBOARD_WINDOW="team-dashboard"
 DASHBOARD_LINES="18"
 DASHBOARD_MESSAGES="24"
 PULSE_WINDOW="team-pulse"
+MAILBOX_WINDOW="team-mailbox"
 MONITOR_WINDOW="team-monitor"
 SWARM_WINDOW="swarm"
 
@@ -43,7 +48,7 @@ DELETE_FORCE="false"
 
 TEAM_LEAD_NAME="lead"
 LEAD_AGENT_TYPE="team-lead"
-TEAMMATE_MODE="tmux"
+TEAMMATE_MODE="in-process-shared"
 TMUX_LAYOUT="split"
 PERMISSION_MODE="default"
 PLAN_MODE_REQUIRED="false"
@@ -71,13 +76,12 @@ LEAD_MODEL=""
 LEAD_PROFILE=""
 GIT_BIN_OVERRIDE=""
 GIT_BIN=""
-BOOT_GIT_BIN="${CODEX_TEAM_GIT_BIN:-${CLAUDE_CODE_TEAM_GIT_BIN:-git}}"
+BOOT_GIT_BIN="git"
 UTILITY_PROFILE=""
 UTILITY_MODEL=""
 WORKER_COUNT="2"
 UTILITY_COUNT="1"
 TEAM_ROLE_SUMMARY=""
-SINGLE_TEAMMATE_MODE="tmux"
 NORMALIZED_TEAMMATE_MODE=""
 
 declare -a TEAM_AGENT_NAMES=()
@@ -88,7 +92,7 @@ declare -A BOOT_PROMPT_BY_AGENT=()
 
 usage() {
   cat <<'USAGE'
-Codex Teams (filesystem mailbox + bus + tmux backend)
+Codex Teams (Windows+WSL only, filesystem mailbox + bus + tmux/in-process backends)
 
 Usage:
   team_codex.sh <command> [options]
@@ -104,6 +108,11 @@ Commands:
   teamdelete              Delete team artifacts
   sendmessage             Send typed team message (Claude Teams-style union)
 
+Platform policy:
+  - Windows host + WSL environment only
+  - repository path must be under /mnt/<drive>/...
+  - fixed team topology: lead + worker-N + utility-1
+
 Common options:
   --repo PATH             Target repo path (default: current directory)
   --config PATH           Config path (default: <repo>/.codex-multi-agent.config.sh)
@@ -118,7 +127,7 @@ Common options:
   --git-bin PATH          Git binary override (e.g. /mnt/c/Program Files/Git/cmd/git.exe)
 
 Backend options:
-  --teammate-mode MODE    single-mode selector; auto|tmux (auto normalizes to tmux)
+  --teammate-mode MODE    auto|tmux|in-process|in-process-shared (default: in-process-shared)
   --tmux-layout MODE      split|window (default: split)
   --permission-mode MODE  default|acceptEdits|bypassPermissions|plan|delegate|dontAsk
   --plan-mode-required    Mark teammate config as plan-mode required
@@ -155,8 +164,8 @@ sendmessage options:
 
 Examples:
   team_codex.sh setup --repo .
-  team_codex.sh run --task "Fix flaky tests" --teammate-mode tmux --tmux-layout split --dashboard
-  team_codex.sh run --task "Batch maintenance" --teammate-mode auto --no-attach
+  team_codex.sh run --task "Fix flaky tests" --teammate-mode in-process-shared --no-attach
+  team_codex.sh run --task "UI pass" --teammate-mode tmux --tmux-layout split --dashboard
   team_codex.sh sendmessage --type shutdown_request --from lead --to worker-2 --content "stop now"
   team_codex.sh sendmessage --type shutdown_response --from lead --to worker-2 --request-id abc123 --approve --content "ok"
 USAGE
@@ -213,6 +222,99 @@ require_subprocess_executable() {
   printf '%s\n' "$resolved"
 }
 
+is_wsl_environment() {
+  if [[ -n "${WSL_INTEROP:-}" || -n "${WSL_DISTRO_NAME:-}" ]]; then
+    return 0
+  fi
+  if [[ -r "/proc/version" ]] && grep -qiE '(microsoft|wsl)' "/proc/version"; then
+    return 0
+  fi
+  return 1
+}
+
+require_windows_wsl_runtime() {
+  if ! is_wsl_environment; then
+    abort "codex-teams is Windows+WSL only. Run this command inside WSL on a Windows host."
+  fi
+  if [[ ! -d "/mnt/c" ]]; then
+    abort "missing Windows mount (/mnt/c). ensure WSL is configured with Windows drive mounts enabled."
+  fi
+  if ! command -v wslpath >/dev/null 2>&1; then
+    abort "wslpath not found. install/restore WSL utilities before running codex-teams."
+  fi
+}
+
+default_windows_git_bin() {
+  if [[ -x "$WINDOWS_GIT_EXE_PATH" ]]; then
+    printf '%s\n' "$WINDOWS_GIT_EXE_PATH"
+  else
+    printf '%s\n' "git"
+  fi
+}
+
+is_windows_mount_path() {
+  local p="${1:-}"
+  [[ "$p" =~ ^/mnt/[A-Za-z]/ ]]
+}
+
+require_windows_repo_path() {
+  local repo_path="${1:-}"
+  if ! is_windows_mount_path "$repo_path"; then
+    abort "repo must be on Windows-mounted storage (/mnt/<drive>/...). current: $repo_path"
+  fi
+}
+
+default_git_bin_for_repo() {
+  local repo_path="${1:-}"
+  if [[ -n "$repo_path" ]] && ! is_windows_mount_path "$repo_path"; then
+    printf '%s\n' "git"
+    return 0
+  fi
+  default_windows_git_bin
+}
+
+resolve_boot_git_bin() {
+  local repo_path="${1:-}"
+  if [[ -n "${CODEX_TEAM_GIT_BIN:-}" ]]; then
+    printf '%s\n' "${CODEX_TEAM_GIT_BIN}"
+  elif [[ -n "${CLAUDE_CODE_TEAM_GIT_BIN:-}" ]]; then
+    printf '%s\n' "${CLAUDE_CODE_TEAM_GIT_BIN}"
+  else
+    default_git_bin_for_repo "$repo_path"
+  fi
+}
+
+is_non_interactive_session() {
+  [[ ! -t 0 || ! -t 1 ]]
+}
+
+is_inside_tmux_sync() {
+  [[ -n "${TMUX:-}" ]]
+}
+
+resolve_teammate_backend() {
+  local requested="${1:-auto}"
+  case "$requested" in
+    tmux|in-process|in-process-shared)
+      printf '%s\n' "$requested"
+      return 0
+      ;;
+    auto)
+      if is_non_interactive_session; then
+        printf '%s\n' "in-process"
+      elif is_inside_tmux_sync; then
+        printf '%s\n' "tmux"
+      else
+        printf '%s\n' "in-process"
+      fi
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 parse_bool_env() {
   local raw="${1:-}"
   case "${raw,,}" in
@@ -251,20 +353,28 @@ repo_path_for_git_bin() {
   local bin="$1"
   local repo_path="$2"
   if is_windows_binary "$bin" && command -v wslpath >/dev/null 2>&1; then
-    wslpath -w "$repo_path"
-  else
-    printf '%s\n' "$repo_path"
+    local converted
+    converted="$(wslpath -m "$repo_path" 2>/dev/null || true)"
+    if [[ -n "$converted" ]]; then
+      printf '%s\n' "$converted"
+      return 0
+    fi
   fi
+  printf '%s\n' "$repo_path"
 }
 
 repo_path_from_git_bin() {
   local bin="$1"
   local repo_path="$2"
   if is_windows_binary "$bin" && command -v wslpath >/dev/null 2>&1; then
-    wslpath -u "$repo_path"
-  else
-    printf '%s\n' "$repo_path"
+    local converted
+    converted="$(wslpath -u "$repo_path" 2>/dev/null || true)"
+    if [[ -n "$converted" ]]; then
+      printf '%s\n' "$converted"
+      return 0
+    fi
   fi
+  printf '%s\n' "$repo_path"
 }
 
 git_repo_cmd() {
@@ -557,12 +667,12 @@ load_config_or_defaults() {
   UTILITY_PROFILE="$WORKER_PROFILE"
   DIRECTOR_INPUT_DELAY="2"
   MERGE_STRATEGY="merge"
-  TEAMMATE_MODE="$SINGLE_TEAMMATE_MODE"
+  TEAMMATE_MODE="in-process-shared"
   TMUX_LAYOUT="split"
   PERMISSION_MODE="default"
   PLAN_MODE_REQUIRED="false"
   AUTO_DELEGATE="true"
-  GIT_BIN="git"
+  GIT_BIN="$(default_git_bin_for_repo "$REPO")"
 
   if [[ -f "$CONFIG" ]]; then
     # shellcheck source=/dev/null
@@ -694,16 +804,10 @@ load_config_or_defaults() {
   case "$USE_BASE_WIP" in true|false) ;; *) abort "USE_BASE_WIP must be true/false" ;; esac
   case "$ALLOW_DIRTY" in true|false) ;; *) abort "ALLOW_DIRTY must be true/false" ;; esac
   case "$KILL_EXISTING_SESSION" in true|false) ;; *) abort "KILL_EXISTING_SESSION must be true/false" ;; esac
-  case "$TEAMMATE_MODE" in auto|tmux) ;; *) abort "TEAMMATE_MODE must be auto|tmux" ;; esac
+  case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "TEAMMATE_MODE must be auto|tmux|in-process|in-process-shared" ;; esac
   case "$TMUX_LAYOUT" in split|window) ;; *) abort "TMUX_LAYOUT must be split|window" ;; esac
   case "$PLAN_MODE_REQUIRED" in true|false) ;; *) abort "PLAN_MODE_REQUIRED must be true|false" ;; esac
   case "$AUTO_DELEGATE" in true|false) ;; *) abort "AUTO_DELEGATE must be true|false" ;; esac
-
-  NORMALIZED_TEAMMATE_MODE=""
-  if [[ "$TEAMMATE_MODE" != "$SINGLE_TEAMMATE_MODE" ]]; then
-    NORMALIZED_TEAMMATE_MODE="$TEAMMATE_MODE"
-  fi
-  TEAMMATE_MODE="$SINGLE_TEAMMATE_MODE"
 
   derive_role_team_shape
 
@@ -716,7 +820,15 @@ load_config_or_defaults() {
   LOG_DIR="$TEAM_ROOT/logs"
   WORKTREES_ROOT="$(abs_path_from "$REPO" "$WORKTREES_DIR")"
 
-  RESOLVED_BACKEND="$SINGLE_TEAMMATE_MODE"
+  RESOLVED_BACKEND="$(resolve_teammate_backend "$TEAMMATE_MODE" || true)"
+  if [[ -z "$RESOLVED_BACKEND" ]]; then
+    abort "failed to resolve backend from TEAMMATE_MODE=$TEAMMATE_MODE"
+  fi
+  if [[ "$TEAMMATE_MODE" == "auto" ]]; then
+    NORMALIZED_TEAMMATE_MODE="$TEAMMATE_MODE -> $RESOLVED_BACKEND"
+  else
+    NORMALIZED_TEAMMATE_MODE=""
+  fi
 }
 
 init_bus_and_dirs() {
@@ -793,12 +905,14 @@ create_or_refresh_team_context() {
     --lead-name "$TEAM_LEAD_NAME" \
     --model "$LEAD_MODEL" \
     --cwd "$REPO" \
+    --backend-type "$RESOLVED_BACKEND" \
+    --mode "$RESOLVED_BACKEND" \
     "${replace_arg[@]}" >/dev/null
 
   # Keep lead/member mode aligned with the enforced runtime backend policy.
   fs_cmd member-mode --repo "$REPO" --session "$TMUX_SESSION" --ident "$TEAM_LEAD_NAME" --mode "$RESOLVED_BACKEND" >/dev/null || true
 
-  local worker_backend="tmux"
+  local worker_backend="$RESOLVED_BACKEND"
 
   local worker
   for worker in "${TEAM_AGENT_NAMES[@]}"; do
@@ -869,20 +983,24 @@ ensure_worktrees() {
   for name in "${TEAM_AGENT_NAMES[@]}"; do
     local branch="ma/$name"
     local wt_path="$WORKTREES_ROOT/$name"
+    local wt_path_for_git
+    wt_path_for_git="$(repo_path_for_git_bin "$GIT_BIN" "$wt_path")"
+    local worktree_list
+    worktree_list="$(git_repo_cmd "$REPO" worktree list --porcelain)"
 
-    if git_repo_cmd "$REPO" worktree list --porcelain | grep -Fxq "worktree $wt_path"; then
+    if grep -Fxq "worktree $wt_path" <<<"$worktree_list" || grep -Fxq "worktree $wt_path_for_git" <<<"$worktree_list"; then
       continue
     fi
 
-    if git_repo_cmd "$REPO" worktree list --porcelain | grep -Fxq "branch refs/heads/$branch"; then
+    if grep -Fxq "branch refs/heads/$branch" <<<"$worktree_list"; then
       echo "skip: $branch already checked out elsewhere" >&2
       continue
     fi
 
     if git_repo_cmd "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
-      git_repo_cmd "$REPO" worktree add "$wt_path" "$branch" >/dev/null
+      git_repo_cmd "$REPO" worktree add "$wt_path_for_git" "$branch" >/dev/null
     else
-      git_repo_cmd "$REPO" worktree add -b "$branch" "$wt_path" "$base_commit" >/dev/null
+      git_repo_cmd "$REPO" worktree add -b "$branch" "$wt_path_for_git" "$base_commit" >/dev/null
     fi
   done
 }
@@ -1040,6 +1158,7 @@ launch_tmux_split_backend() {
   fi
 
   tmux new-session -d -s "$TMUX_SESSION" -n "$SWARM_WINDOW" -c "$REPO"
+  tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
   tmux set-option -t "$TMUX_SESSION" -g pane-border-status top >/dev/null 2>&1 || true
   tmux set-option -t "$TMUX_SESSION" -g pane-border-format '#{pane_title}' >/dev/null 2>&1 || true
 
@@ -1099,6 +1218,7 @@ launch_tmux_window_backend() {
   fi
 
   tmux new-session -d -s "$TMUX_SESSION" -n "$TEAM_LEAD_NAME" -c "$REPO"
+  tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
   local lead_cmd
   local lead_boot_prompt
   lead_boot_prompt="$(agent_boot_prompt "$TEAM_LEAD_NAME")"
@@ -1136,7 +1256,103 @@ launch_tmux_window_backend() {
   tmux select-window -t "$TMUX_SESSION:$TEAM_LEAD_NAME"
 }
 
+spawn_inprocess_backend() {
+  require_cmd nohup
+  mkdir -p "$LOG_DIR"
+
+  local inprocess_agents=("$TEAM_LEAD_NAME" "${TEAM_AGENT_NAMES[@]}")
+  local agent
+  for agent in "${inprocess_agents[@]}"; do
+    local wt_path
+    local role
+    local profile
+    local model
+    if [[ "$agent" == "$TEAM_LEAD_NAME" ]]; then
+      wt_path="$REPO"
+      role="lead"
+      profile="$LEAD_PROFILE"
+      model="$LEAD_MODEL"
+    else
+      wt_path="$WORKTREES_ROOT/$agent"
+      role="${TEAM_AGENT_ROLE[$agent]}"
+      profile="${TEAM_AGENT_PROFILE[$agent]}"
+      model="${TEAM_AGENT_MODEL[$agent]}"
+    fi
+    if [[ ! -d "$wt_path" ]]; then
+      echo "skip missing worktree: $wt_path" >&2
+      continue
+    fi
+
+    local log_file="$LOG_DIR/$agent.log"
+    local args=(
+      python3 "$INPROCESS_AGENT"
+      --repo "$REPO"
+      --session "$TMUX_SESSION"
+      --room "$ROOM"
+      --agent "$agent"
+      --role "$role"
+      --cwd "$wt_path"
+      --profile "$profile"
+      --model "$model"
+      --codex-bin "$CODEX_BIN"
+      --permission-mode "$PERMISSION_MODE"
+    )
+    if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
+      args+=(--plan-mode-required)
+    fi
+
+    nohup "${args[@]}" >"$log_file" 2>&1 &
+    local pid=$!
+
+    fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --backend in-process --status running --pid "$pid" --window in-process >/dev/null
+    python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role "$role" >/dev/null
+    python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status --body "spawned in-process agent=$agent pid=$pid log=$log_file" >/dev/null
+  done
+}
+
+spawn_inprocess_shared_backend() {
+  require_cmd nohup
+  mkdir -p "$LOG_DIR"
+
+  local hub_log="$LOG_DIR/inprocess-hub.log"
+  local hub_agents=("$TEAM_LEAD_NAME" "${TEAM_AGENT_NAMES[@]}")
+  local hub_count="${#hub_agents[@]}"
+  local agents_csv
+  agents_csv="$(IFS=,; echo "${hub_agents[*]}")"
+  local args=(
+    python3 "$INPROCESS_HUB"
+    --repo "$REPO"
+    --session "$TMUX_SESSION"
+    --room "$ROOM"
+    --prefix "$PREFIX"
+    --count "$COUNT"
+    --agents-csv "$agents_csv"
+    --worktrees-root "$WORKTREES_ROOT"
+    --profile "$WORKER_PROFILE"
+    --model "$WORKER_MODEL"
+    --lead-name "$TEAM_LEAD_NAME"
+    --lead-cwd "$REPO"
+    --lead-profile "$LEAD_PROFILE"
+    --lead-model "$LEAD_MODEL"
+    --codex-bin "$CODEX_BIN"
+    --permission-mode "$PERMISSION_MODE"
+  )
+  if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
+    args+=(--plan-mode-required)
+  fi
+
+  nohup "${args[@]}" >"$hub_log" 2>&1 &
+  local pid=$!
+
+  python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
+    --body "spawned in-process shared hub pid=$pid members=$hub_count roles=[$TEAM_ROLE_SUMMARY] log=$hub_log" >/dev/null
+}
+
 launch_aux_windows() {
+  if [[ "$RESOLVED_BACKEND" != "tmux" ]]; then
+    return 0
+  fi
+
   if window_exists "$TMUX_SESSION" "$MONITOR_WINDOW"; then
     tmux send-keys -t "$TMUX_SESSION:$MONITOR_WINDOW" C-c >/dev/null 2>&1 || true
   else
@@ -1166,6 +1382,15 @@ launch_aux_windows() {
   pulse_agents="$(IFS=,; echo "${TEAM_AGENT_NAMES[*]}")"
   tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" \
     "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --agents-csv '$pulse_agents' --lead-name '$TEAM_LEAD_NAME'" C-m
+
+  if window_exists "$TMUX_SESSION" "$MAILBOX_WINDOW"; then
+    tmux send-keys -t "$TMUX_SESSION:$MAILBOX_WINDOW" C-c >/dev/null 2>&1 || true
+  else
+    tmux new-window -t "$TMUX_SESSION" -n "$MAILBOX_WINDOW" -c "$REPO"
+  fi
+  tmux select-pane -t "$TMUX_SESSION:$MAILBOX_WINDOW.0" -T "mailbox-bridge" >/dev/null 2>&1 || true
+  tmux send-keys -t "$TMUX_SESSION:$MAILBOX_WINDOW" \
+    "python3 '$TMUX_MAILBOX_BRIDGE' --repo '$REPO' --session '$TMUX_SESSION' --room '$ROOM' --tmux-session '$TMUX_SESSION' --lead-name '$TEAM_LEAD_NAME'" C-m
 }
 
 role_primary_objective() {
@@ -1196,14 +1421,16 @@ build_role_task_prompt() {
   local role_specific_contract=""
   if [[ "$role" == "worker" ]]; then
     role_specific_contract="$(cat <<EOF
-7. If anything is unknown mid-task, ask lead immediately with \`question\`; do not guess critical requirements.
-8. If you request additional research/planning, lead must run it and send you a refined plan/task update before major implementation continues.
+7. Maintain continuous peer collaboration: when your output depends on another worker/utility, send \`question\` and keep Q/A looping until dependency is closed.
+8. If anything is unknown mid-task, ask lead immediately with \`question\` (summary: research-request); do not guess critical requirements.
+9. If lead responds with refined guidance/research, convert it into concrete next edits/tests and report back with \`status\`.
 EOF
 )"
   elif [[ "$role" == "utility" ]]; then
     role_specific_contract="$(cat <<EOF
-7. If release/merge context is unclear, ask lead and wait for explicit handoff approval.
-8. Use the configured git binary for push/merge operations when available: \`"$GIT_BIN"\`.
+7. Keep continuous sync with workers on release-impacting changes; resolve interface gaps through \`question\`/\`answer\` loops.
+8. If release/merge context is unclear, ask lead and wait for explicit handoff approval.
+9. Use the configured git binary for push/merge operations when available: \`"$GIT_BIN"\`.
 EOF
 )"
   fi
@@ -1221,7 +1448,7 @@ $user_task
 Execution contract:
 1. Start immediately and keep changes scoped to your role responsibility.
 2. Lead($TEAM_LEAD_NAME) owns research/planning/review orchestration and must not execute implementation tasks. Escalate blockers/questions to lead.
-3. Realtime collaboration is mandatory: when interfaces/requirements are unclear, ask $peer with \`question\` and continue iterative Q/A until closed.
+3. Realtime collaboration is mandatory and continuous: when interfaces/requirements are unclear, ask $peer with \`question\`, reply with \`answer\`, and keep iterative loops until closed.
 4. Send progress and completion updates:
    codex-teams sendmessage --session "$TMUX_SESSION" --room "$ROOM" --type status --from "$agent" --to "$TEAM_LEAD_NAME" --summary "<progress|done|blocker>" --content "<update>"
 5. Include evidence in done: changed files + validation command outputs + residual risk.
@@ -1244,9 +1471,10 @@ Operating policy:
 2. Produce a concrete execution plan.
 3. Adjust worker allocation within configured worker pool.
 4. Delegate implementation tasks to worker-* agents.
-5. Coordinate in real time, intervene on blockers, and perform final review.
+5. Coordinate in real time, intervene on blockers, and keep worker/utility collaboration loops active until resolution.
 6. Handoff approved changes to utility-1 for git push and merge workflow.
-7. If a worker requests additional research/planning mid-task, perform it immediately and send refined guidance back to that worker as a follow-up task/status.
+7. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
+8. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
 
 Hard constraint:
 - Do not implement code directly; lead is orchestration-only.
@@ -1276,7 +1504,7 @@ prepare_initial_boot_prompts() {
 
 announce_collaboration_workflow() {
   local workflow_summary
-  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(iterative)->on-demand-research-by-lead->lead-review->utility-push/merge; lead=orchestration-only; role-shape=[$TEAM_ROLE_SUMMARY]; policy=adaptive-worker-pool-2..4"
+  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(continuous)->on-demand-research-by-lead->lead-review->utility-push/merge; lead=orchestration-only; unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=adaptive-worker-pool-2..4"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status --body "$workflow_summary" >/dev/null
   fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from orchestrator --recipient all --summary "workflow-fixed" --content "$workflow_summary" >/dev/null || true
 }
@@ -1344,12 +1572,12 @@ print_start_summary() {
   echo "- repo: $REPO"
   echo "- session: $TMUX_SESSION"
   echo "- backend: $RESOLVED_BACKEND"
-  echo "- backend policy: single-mode $SINGLE_TEAMMATE_MODE (Claude Teams-style)"
   if [[ -n "$NORMALIZED_TEAMMATE_MODE" ]]; then
-    echo "- backend request normalized: $NORMALIZED_TEAMMATE_MODE -> $SINGLE_TEAMMATE_MODE"
+    echo "- backend request normalized: $NORMALIZED_TEAMMATE_MODE"
   fi
   if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
     echo "- tmux layout: $TMUX_LAYOUT"
+    echo "- tmux mailbox bridge window: $MAILBOX_WINDOW"
   fi
   echo "- role members: ${#TEAM_AGENT_NAMES[@]} ($TEAM_ROLE_SUMMARY)"
   echo "- worker pool: $WORKER_COUNT"
@@ -1366,6 +1594,11 @@ print_start_summary() {
   if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" || -n "$UTILITY_MODEL" ]]; then
     echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>} utility=${UTILITY_MODEL:-<default>}"
   fi
+  if [[ "$RESOLVED_BACKEND" == "in-process" ]]; then
+    echo "- logs: $LOG_DIR/<agent>.log"
+  elif [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
+    echo "- logs: $LOG_DIR/inprocess-hub.log"
+  fi
   echo "- status: TEAM_DB='$DB' '$STATUS' --room '$ROOM'"
   echo "- mailbox: TEAM_DB='$DB' '$MAILBOX' --repo '$REPO' --session '$TMUX_SESSION' inbox <agent> --unread"
   echo "- control: TEAM_DB='$DB' '$CONTROL' --repo '$REPO' --session '$TMUX_SESSION' request --type plan_approval <from> <to> <body>"
@@ -1374,7 +1607,6 @@ print_start_summary() {
 run_swarm() {
   require_cmd "$GIT_BIN"
   require_cmd python3
-  require_cmd tmux
   CODEX_BIN="$(require_subprocess_executable "$CODEX_BIN" "codex binary")"
   require_repo_ready_for_run
 
@@ -1387,13 +1619,22 @@ run_swarm() {
   ensure_worktrees
 
   prepare_initial_boot_prompts
-  make_wrapper
-  if [[ "$TMUX_LAYOUT" == "split" ]]; then
-    launch_tmux_split_backend
+  if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
+    require_cmd tmux
+    make_wrapper
+    if [[ "$TMUX_LAYOUT" == "split" ]]; then
+      launch_tmux_split_backend
+    else
+      launch_tmux_window_backend
+    fi
+    launch_aux_windows
   else
-    launch_tmux_window_backend
+    if [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
+      spawn_inprocess_shared_backend
+    else
+      spawn_inprocess_backend
+    fi
   fi
-  launch_aux_windows
 
   write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
 
@@ -1408,7 +1649,7 @@ run_swarm() {
   inject_initial_task
   print_start_summary
 
-  if [[ "$NO_ATTACH" != "true" ]]; then
+  if [[ "$RESOLVED_BACKEND" == "tmux" && "$NO_ATTACH" != "true" ]]; then
     tmux attach -t "$TMUX_SESSION"
   fi
 }
@@ -1529,12 +1770,44 @@ apply_shutdown_target() {
       tmux kill-window -t "$TMUX_SESSION:$window" >/dev/null 2>&1 || true
     fi
     fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
+  elif [[ "$backend" == "in-process" || "$backend" == "in-process-shared" ]]; then
+    fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --signal term >/dev/null || true
   elif [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
     kill "$pid" >/dev/null 2>&1 || true
     fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
   fi
 
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status --body "shutdown-applied target=$target backend=${backend:-unknown}" >/dev/null || true
+}
+
+force_terminate_runtime_agents() {
+  if [[ ! -f "$TEAM_ROOT/runtime.json" ]]; then
+    return 0
+  fi
+
+  local running_agents
+  running_agents="$(python3 - "$TEAM_ROOT/runtime.json" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        runtime = json.load(f)
+except Exception:
+    raise SystemExit(0)
+agents = runtime.get("agents", {})
+if not isinstance(agents, dict):
+    raise SystemExit(0)
+for name, record in agents.items():
+    if isinstance(record, dict) and str(record.get("status", "")) == "running":
+        print(str(name))
+PY
+)"
+  local agent
+  while IFS= read -r agent; do
+    [[ -z "$agent" ]] && continue
+    fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --signal term >/dev/null 2>&1 || true
+  done <<< "$running_agents"
 }
 
 cmd_teamcreate() {
@@ -1603,6 +1876,10 @@ EOF
 
 cmd_teamdelete() {
   load_config_or_defaults
+
+  if [[ "$DELETE_FORCE" == "true" ]]; then
+    force_terminate_runtime_agents
+  fi
 
   if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
     if [[ "$DELETE_FORCE" == "true" ]]; then
@@ -1906,6 +2183,8 @@ parse_args() {
       ;;
   esac
 
+  require_windows_wsl_runtime
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo)
@@ -2104,6 +2383,9 @@ parse_args() {
   done
 
   REPO="$(cd "$REPO" && pwd)"
+  require_windows_repo_path "$REPO"
+  BOOT_GIT_BIN="$(resolve_boot_git_bin "$REPO")"
+  BOOT_GIT_BIN="$(require_subprocess_executable "$BOOT_GIT_BIN" "boot git binary")"
   if [[ "$COMMAND" != "setup" ]]; then
     local repo_for_boot_git
     repo_for_boot_git="$(repo_path_for_git_bin "$BOOT_GIT_BIN" "$REPO")"
@@ -2113,6 +2395,7 @@ parse_args() {
     local repo_resolved
     repo_resolved="$("$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --show-toplevel)"
     REPO="$(repo_path_from_git_bin "$BOOT_GIT_BIN" "$repo_resolved")"
+    require_windows_repo_path "$REPO"
   fi
 
   if [[ -z "$CONFIG" ]]; then
@@ -2127,7 +2410,7 @@ parse_args() {
   if ! [[ "$DASHBOARD_MESSAGES" =~ ^[0-9]+$ ]] || [[ "$DASHBOARD_MESSAGES" -lt 1 ]]; then
     abort "--dashboard-messages must be >= 1"
   fi
-  case "$TEAMMATE_MODE" in auto|tmux) ;; *) abort "--teammate-mode must be auto|tmux (auto is normalized to tmux)" ;; esac
+  case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "--teammate-mode must be auto|tmux|in-process|in-process-shared" ;; esac
   case "$TMUX_LAYOUT" in split|window) ;; *) abort "--tmux-layout must be split|window" ;; esac
 }
 
