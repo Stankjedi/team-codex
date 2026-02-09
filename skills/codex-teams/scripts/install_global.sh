@@ -93,6 +93,13 @@ fi
 if [[ "$NO_LAUNCHERS" == "false" ]]; then
   mkdir -p "$BIN_DIR"
 
+  cat > "$BIN_DIR/codex-teams" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$TARGET_DIR/scripts/team_codex.sh" "\$@"
+EOF
+  chmod +x "$BIN_DIR/codex-teams"
+
   cat > "$BIN_DIR/codex-teams-ma" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -106,6 +113,34 @@ set -euo pipefail
 exec "$TARGET_DIR/scripts/team_dashboard.sh" "\$@"
 EOF
   chmod +x "$BIN_DIR/codex-teams-dashboard"
+
+  cat > "$BIN_DIR/codex-teams-mailbox" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$TARGET_DIR/scripts/team_mailbox.sh" "\$@"
+EOF
+  chmod +x "$BIN_DIR/codex-teams-mailbox"
+
+  cat > "$BIN_DIR/codex-teams-control" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$TARGET_DIR/scripts/team_control.sh" "\$@"
+EOF
+  chmod +x "$BIN_DIR/codex-teams-control"
+
+  cat > "$BIN_DIR/codex-teams-pulse" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$TARGET_DIR/scripts/team_pulse.sh" "\$@"
+EOF
+  chmod +x "$BIN_DIR/codex-teams-pulse"
+
+  cat > "$BIN_DIR/codex-teams-fs" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "python3" "$TARGET_DIR/scripts/team_fs.py" "\$@"
+EOF
+  chmod +x "$BIN_DIR/codex-teams-fs"
 fi
 
 # Cleanup legacy launcher from older versions.
@@ -118,10 +153,17 @@ Installed skill:
 - $TARGET_DIR
 
 Launchers:
+- $BIN_DIR/codex-teams
 - $BIN_DIR/codex-teams-ma
 - $BIN_DIR/codex-teams-dashboard
+- $BIN_DIR/codex-teams-mailbox
+- $BIN_DIR/codex-teams-control
+- $BIN_DIR/codex-teams-pulse
+- $BIN_DIR/codex-teams-fs
 
 Next:
-- codex-teams-ma run --task "<task>"
-- (optional) codex-teams-ma run --task "<task>" --workers 3
+- codex-teams teamcreate --session codex-fleet --workers 4
+- codex-teams run --task "<task>" --session codex-fleet
+- (optional) codex-teams run --task "<task>" --workers 3
+- (legacy alias) codex-teams-ma run --task "<task>"
 EOF

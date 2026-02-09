@@ -2,7 +2,7 @@
   "name": "antigravity-codex-teams-viewer",
   "displayName": "Antigravity Codex Teams Viewer",
   "description": "View live Codex Teams tmux/TUI output in WSL from a single VS Code webview dashboard.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "antigravity",
   "engines": {
     "vscode": "^1.85.0"
@@ -95,6 +95,16 @@
           "default": "${workspaceFolder}",
           "description": "Repository path that contains .codex-teams. Use ${workspaceFolder} for current project."
         },
+        "agCodexTeamsViewer.useSkillBridge": {
+          "type": "boolean",
+          "default": true,
+          "description": "codex-teams 실행 시 생성되는 브리지 파일(.viewer-session.json)을 자동 감지해 session/room/repo를 따라갑니다."
+        },
+        "agCodexTeamsViewer.skillBridgePath": {
+          "type": "string",
+          "default": "${workspaceFolder}/.codex-teams/.viewer-session.json",
+          "description": "브리지 파일 경로. useSkillBridge=true일 때 사용됩니다."
+        },
         "agCodexTeamsViewer.refreshMs": {
           "type": "number",
           "default": 1200,
@@ -117,6 +127,11 @@
           "type": "string",
           "default": "",
           "description": "Optional custom command path for team_dashboard.sh. Leave empty to auto-detect codex-teams-dashboard."
+        },
+        "agCodexTeamsViewer.wslDistro": {
+          "type": "string",
+          "default": "",
+          "description": "Windows 전용: 특정 WSL 배포판 이름. 비우면 기본 배포판을 사용합니다."
         },
         "agCodexTeamsViewer.autoOpenOnStartup": {
           "type": "boolean",

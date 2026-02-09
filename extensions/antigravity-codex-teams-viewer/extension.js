@@ -16,35 +16,210 @@ function shQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function resolveRepoPath(config) {
-  let repo = config.get('repoPath', '${workspaceFolder}');
-  if (repo.includes('${workspaceFolder}')) {
+function winPathToWsl(inputPath) {
+  if (!inputPath) {
+    return '';
+  }
+  const m = /^([a-zA-Z]):[\\/](.*)$/.exec(String(inputPath));
+  if (!m) {
+    return '';
+  }
+  const drive = m[1].toLowerCase();
+  const rest = m[2].replace(/\\/g, '/');
+  return `/mnt/${drive}/${rest}`;
+}
+
+function wslPathToWin(inputPath) {
+  if (!inputPath) {
+    return '';
+  }
+  const m = /^\/mnt\/([a-zA-Z])\/(.*)$/.exec(String(inputPath));
+  if (!m) {
+    return '';
+  }
+  const drive = m[1].toUpperCase();
+  const rest = m[2].replace(/\//g, '\\');
+  return `${drive}:\\${rest}`;
+}
+
+function toLocalFsPath(inputPath) {
+  if (process.platform !== 'win32') {
+    return String(inputPath || '');
+  }
+  return wslPathToWin(inputPath) || String(inputPath || '');
+}
+
+function resolvePathTemplate(input) {
+  let value = String(input || '').trim();
+  if (!value) {
+    return '';
+  }
+  if (value.includes('${workspaceFolder}')) {
     const folders = vscode.workspace.workspaceFolders;
     const ws = folders && folders.length > 0 ? folders[0].uri.fsPath : process.cwd();
-    repo = repo.replace('${workspaceFolder}', ws);
+    value = value.replace(/\$\{workspaceFolder\}/g, ws);
   }
-  const winDriveMatch = /^([a-zA-Z]):[\\/](.*)$/.exec(repo);
-  if (winDriveMatch) {
-    const drive = winDriveMatch[1].toLowerCase();
-    const rest = winDriveMatch[2].replace(/\\/g, '/');
-    repo = `/mnt/${drive}/${rest}`;
+  return value;
+}
+
+function normalizeDashboardCommand(command) {
+  const raw = String(command || '').trim();
+  if (!raw || process.platform !== 'win32') {
+    return raw;
+  }
+
+  const quotedMatch = /^(['"])([a-zA-Z]:[\\/][^'"]+)\1(\s+.*)?$/.exec(raw);
+  if (quotedMatch) {
+    const converted = winPathToWsl(quotedMatch[2]);
+    if (converted) {
+      return `${shQuote(converted)}${quotedMatch[3] || ''}`;
+    }
+    return raw;
+  }
+
+  const plainMatch = /^([a-zA-Z]:[\\/][^\s]+)(\s+.*)?$/.exec(raw);
+  if (plainMatch) {
+    const converted = winPathToWsl(plainMatch[1]);
+    if (converted) {
+      return `${shQuote(converted)}${plainMatch[2] || ''}`;
+    }
+  }
+
+  return raw;
+}
+
+function resolveBridgePath(config) {
+  if (!config.get('useSkillBridge', true)) {
+    return '';
+  }
+
+  let bridgePath = resolvePathTemplate(
+    config.get('skillBridgePath', '${workspaceFolder}/.codex-teams/.viewer-session.json')
+  );
+  if (!bridgePath) {
+    return '';
+  }
+  if (process.platform === 'win32') {
+    const asWin = wslPathToWin(bridgePath);
+    if (asWin) {
+      bridgePath = asWin;
+    }
+  }
+  return bridgePath;
+}
+
+function resolveSkillBridge(config) {
+  const bridgePath = resolveBridgePath(config);
+  if (!bridgePath || !fs.existsSync(bridgePath)) {
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(bridgePath, 'utf8');
+    const payload = JSON.parse(raw);
+    const session = String(payload.session || '').trim();
+    if (!session) {
+      return null;
+    }
+    const room = String(payload.room || 'main').trim() || 'main';
+    const bridgeRepo = String(payload.repo || '').trim();
+    if (!bridgeRepo) {
+      return null;
+    }
+    const localRepo = toLocalFsPath(bridgeRepo);
+    const localSessionRoot = path.join(localRepo, '.codex-teams', session);
+    if (!fs.existsSync(localSessionRoot)) {
+      return null;
+    }
+    const repo = winPathToWsl(bridgeRepo) || bridgeRepo;
+    return {
+      session,
+      room,
+      repo,
+      backend: String(payload.backend || '').trim(),
+      updatedAt: String(payload.updated_at || '').trim(),
+      bridgePath
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveDashboardTarget(config) {
+  const base = {
+    session: String(config.get('session', 'codex-fleet')),
+    room: String(config.get('room', 'main')),
+    repo: resolveRepoPath(config),
+    source: 'settings',
+    bridgePath: ''
+  };
+  const bridge = resolveSkillBridge(config);
+  if (!bridge) {
+    return base;
+  }
+  return {
+    session: bridge.session,
+    room: bridge.room,
+    repo: bridge.repo,
+    source: 'skill-bridge',
+    bridgePath: bridge.bridgePath,
+    backend: bridge.backend,
+    updatedAt: bridge.updatedAt
+  };
+}
+
+function resolveRepoPath(config) {
+  let repo = resolvePathTemplate(config.get('repoPath', '${workspaceFolder}'));
+  const asWsl = winPathToWsl(repo);
+  if (asWsl) {
+    repo = asWsl;
   }
   return repo;
 }
 
-function resolveDashboardCommand(config) {
-  const explicit = config.get('dashboardCommand', '').trim();
+function resolveDashboardCommands(config) {
+  const explicit = normalizeDashboardCommand(config.get('dashboardCommand', '').trim());
   if (explicit) {
-    return explicit;
+    return [explicit];
   }
 
-  const launcher = 'codex-teams-dashboard';
-  const fallback = path.join(os.homedir(), '.codex', 'skills', 'codex-teams', 'scripts', 'team_dashboard.sh');
+  const commands = [
+    'codex-teams-dashboard',
+    '"$HOME/.codex/skills/codex-teams/scripts/team_dashboard.sh"'
+  ];
 
-  if (fs.existsSync(fallback)) {
-    return `${launcher} || ${shQuote(fallback)}`;
+  if (process.platform === 'win32') {
+    const fallback = path.join(os.homedir(), '.codex', 'skills', 'codex-teams', 'scripts', 'team_dashboard.sh');
+    if (fs.existsSync(fallback)) {
+      const asWsl = winPathToWsl(fallback);
+      if (asWsl) {
+        commands.push(shQuote(asWsl));
+      }
+    }
   }
-  return launcher;
+
+  return commands;
+}
+
+function resolveShellRunner(script, config) {
+  if (process.platform === 'win32') {
+    const distro = String(config.get('wslDistro', '') || '').trim();
+    const args = [];
+    if (distro) {
+      args.push('-d', distro);
+    }
+    args.push('bash', '-lc', script);
+    const previewPrefix = distro ? `wsl.exe -d ${distro}` : 'wsl.exe';
+    return {
+      file: 'wsl.exe',
+      args,
+      preview: `${previewPrefix} bash -lc ${shQuote(script)}`
+    };
+  }
+  return {
+    file: 'bash',
+    args: ['-lc', script],
+    preview: `bash -lc ${shQuote(script)}`
+  };
 }
 
 function hasActiveTargets() {
@@ -311,20 +486,24 @@ function wireWebview(webview) {
 
 function runDashboardOnce() {
   const cfg = vscode.workspace.getConfiguration('agCodexTeamsViewer');
-  const session = cfg.get('session', 'codex-fleet');
-  const room = cfg.get('room', 'main');
-  const repo = resolveRepoPath(cfg);
+  const target = resolveDashboardTarget(cfg);
+  const session = target.session;
+  const room = target.room;
+  const repo = target.repo;
   const refreshMs = Math.max(500, Number(cfg.get('refreshMs', 1200)) || 1200);
   const lines = Math.max(5, Number(cfg.get('lines', 18)) || 18);
   const messages = Math.max(5, Number(cfg.get('messages', 24)) || 24);
 
-  const commandExpr = resolveDashboardCommand(cfg);
-  const script = `${commandExpr} --session ${shQuote(session)} --repo ${shQuote(repo)} --room ${shQuote(room)} --lines ${shQuote(lines)} --messages ${shQuote(messages)} --once`;
+  const dashboardArgs = `--session ${shQuote(session)} --repo ${shQuote(repo)} --room ${shQuote(room)} --lines ${shQuote(lines)} --messages ${shQuote(messages)} --once`;
+  const commandExpr = resolveDashboardCommands(cfg)
+    .map((cmd) => `${cmd} ${dashboardArgs}`)
+    .join(' || ');
+  const runner = resolveShellRunner(commandExpr, cfg);
 
   return new Promise((resolve) => {
     execFile(
-      'bash',
-      ['-lc', script],
+      runner.file,
+      runner.args,
       { timeout: Math.max(3000, refreshMs - 100), maxBuffer: 8 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
@@ -333,7 +512,10 @@ function runDashboardOnce() {
             text: [
               `dashboard command failed: ${error.message}`,
               stderr ? `stderr:\n${stderr}` : '',
-              `command: ${script}`
+              `target: session=${session} room=${room} repo=${repo} source=${target.source}`,
+              target.bridgePath ? `bridge: ${target.bridgePath}` : '',
+              `command: ${commandExpr}`,
+              `runner: ${runner.preview}`
             ].filter(Boolean).join('\n\n')
           });
           return;
@@ -342,7 +524,9 @@ function runDashboardOnce() {
         resolve({
           ok: true,
           text: stdout || '(no output)',
-          stderr: stderr || ''
+          stderr: stderr || '',
+          source: target.source,
+          target
         });
       }
     );
@@ -366,13 +550,14 @@ async function pushSnapshot() {
     const result = await runDashboardOnce();
     const ms = Date.now() - started;
     const rendered = result.ok ? formatDashboardText(result.text) : { html: '', legend: '' };
+    const sourceLabel = result.source === 'skill-bridge' ? 'bridge' : 'manual';
     broadcastSnapshot({
       type: 'snapshot',
       ok: result.ok,
       text: result.text,
       html: rendered.html,
       legend: rendered.legend,
-      status: `${result.ok ? 'ok' : 'error'} · ${new Date().toLocaleTimeString()} · ${ms}ms`
+      status: `${result.ok ? 'ok' : 'error'} · ${sourceLabel} · ${new Date().toLocaleTimeString()} · ${ms}ms`
     });
   } finally {
     inFlight = false;

@@ -1,11 +1,11 @@
 ---
 name: codex-teams
-description: Launch and operate Codex multi-agent sessions with real-time inter-agent messaging over a shared local bus. Use when tasks need director-worker collaboration, parallel streams, fast blocker resolution, codex-ma worktree orchestration, or Claude Teams-style live coordination.
+description: Launch and operate Codex multi-agent sessions with real-time inter-agent messaging over a shared local bus. Use when tasks need director-worker collaboration, parallel streams, fast blocker resolution, worktree orchestration, or Claude Teams-style live coordination.
 ---
 
 # Codex Teams
 
-Run director + workers with live team chat over a local SQLite bus, centered on `codex-ma` orchestration.
+Codex CLI + tmux/in-process + SQLite bus + filesystem mailbox 기반 멀티 에이전트 스킬.
 
 ## Quick Start
 
@@ -14,101 +14,111 @@ Run director + workers with live team chat over a local SQLite bus, centered on 
 ./scripts/install_global.sh
 ```
 
-2. Run with `codex-ma` bridge (worktrees + real-time bus):
+2. Create team context (`TeamCreate` equivalent):
 ```bash
-codex-teams-ma run --task "<user task>" --dashboard
+codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo task force"
 ```
 
-3. Monitor all traffic:
+3. Run swarm with Codex CLI panes:
+```bash
+codex-teams run --task "<user task>" --session codex-fleet --teammate-mode tmux --tmux-layout split --dashboard
+```
+
+4. Or run in-process teammates:
+```bash
+codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process --no-attach
+```
+
+5. Monitor bus directly:
 ```bash
 TEAM_DB=.codex-teams/codex-fleet/bus.sqlite ./scripts/team_tail.sh --all monitor
 ```
 
-4. Open unified terminal dashboard:
+6. Open unified terminal dashboard:
 ```bash
-./scripts/team_dashboard.sh --session codex-fleet --room main
+codex-teams-dashboard --session codex-fleet --repo <repo> --room main
 ```
 
-5. Send direct message:
+7. Send team message (`SendMessage` equivalent):
 ```bash
-TEAM_DB=.codex-teams/codex-fleet/bus.sqlite ./scripts/team_send.sh director pair-1 "Own reconnect logic"
+codex-teams sendmessage --session codex-fleet --type message --from director --to pair-1 --content "Own reconnect logic"
 ```
 
-## Launch Mode
+## Runtime Layout
 
-### codex-ma bridge mode
-Use when you want worktree isolation and director-managed merge flow:
-```bash
-./scripts/team_codex_ma.sh run --task "<task>" --dashboard
-```
+`codex-teams run/up` modes:
+- `--teammate-mode auto`: TTY/tmux 환경 기준 자동 선택
+- `--teammate-mode tmux`: tmux 세션에 director/worker 패널 생성
+- `--teammate-mode in-process`: 파일 mailbox 폴링 루프 기반 워커 실행
+- 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
+- `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
 
-`--workers`를 지정하지 않으면 오케스트레이터가 작업량을 평가해 pair 수를 2~4 범위로 자동 조정합니다.
+tmux mode layout:
+- tmux session `<session>`
+- window `swarm`: `director` + `pair-N` split panes (same TUI)
+- window `team-monitor`: full bus tail
+- window `team-pulse`: pane activity heartbeat emitter
+- optional window `team-dashboard` with `--dashboard`
 
-This mode:
-- launches `codex-ma run` using repo config
-- attaches live tail panes to director/worker windows
-- adds `team-monitor` window with full bus traffic
-- optionally adds `team-dashboard` window (`--dashboard`)
-- keeps `codex-ma merge` flow for final integration
+This gives Claude Teams-style parallel visibility while keeping Codex CLI sessions native.
 
-## Model Selection
+## TeamCreate/TeamDelete
 
-Model can be controlled in three ways (highest precedence first):
+- `teamcreate` creates/refreshes:
+  - `.codex-teams/<session>/config.json` + `team.json`
+  - `.codex-teams/<session>/inboxes/*.json`
+  - `.codex-teams/<session>/control.json` (control request lifecycle)
+  - `.codex-teams/<session>/state.json` + `runtime.json`
+  - `.codex-teams/<session>/bus.sqlite`
+  - room member registrations (`director`, `pair-N`, `system`, `monitor`, `orchestrator`)
+- `teamdelete` removes the team folder (or force-kills active tmux session first).
 
-1. CLI override
-```bash
-codex-teams-ma run --task "<task>" --model gpt-5.3-codex
-```
+## Message Contract
 
-2. Role override in config (`.codex/config.toml` or `~/.codex/config.toml`)
-```toml
-[codex_teams]
-director_model = "gpt-5.3-codex"
-worker_model = "gpt-5.3-codex"
-```
+Roles:
+- `director`, `pair-N`, `monitor`, `system`, `orchestrator`
 
-3. Existing Codex profile/default model
-```toml
-[profiles.director]
-model = "gpt-5.3-codex"
+Kinds:
+- `task`, `question`, `answer`, `status`, `blocker`, `system`
+- `message`, `broadcast`
+- `plan_approval_request/response`, `shutdown_request/response`, `permission_request/response`
+- `shutdown_approved`, `shutdown_rejected`, `mode_set_request/response`
 
-[profiles.pair]
-model = "gpt-5.3-codex"
-```
-
-Resolver script: `scripts/resolve_model.py`.
-
-## Messaging Contract
-
-- Roles: `director`, `worker-N` (or `pair-N` in codex-ma windows)
-- Kinds: `task`, `question`, `answer`, `status`, `blocker`, `system`
-- Worker cadence: start status, milestone status, completion handoff
-- Blocker message must include at least one workaround option
+Control request types are tracked in both SQLite and filesystem (`control.json`) with shared `request_id`.
 
 Full protocol: `references/protocol.md`
 
-## AutoTrader Plan Usage
+## Model Selection
 
-When the user provides the staged AutoTrader Task 00-12 plan, split and run in waves from:
-`references/autotrader-task-routing.md`
+Model precedence (highest first):
+1. CLI override (`--model`, `--director-model`, `--worker-model`)
+2. Project/user `.codex/config.toml` via `resolve_model.py`
+3. Codex profile defaults
 
 ## Scripts
 
-- `scripts/install_global.sh`: install skill into `~/.codex/skills` and launcher commands
-- `scripts/team_codex_ma.sh`: bridge `codex-ma` with real-time team bus
-- `scripts/team_bus.py`: SQLite bus (`init`, `send`, `tail`, `status`)
-- `scripts/team_send.sh`: sender wrapper
-- `scripts/team_tail.sh`: follower wrapper
-- `scripts/team_status.sh`: bus summary
-- `scripts/team_dashboard.sh`: single-terminal live dashboard (messages + per-window outputs)
-- `scripts/resolve_model.py`: layered config model resolver
+- `scripts/team_codex.sh`: main entrypoint (`run/up/status/merge/teamcreate/teamdelete/sendmessage`)
+- `scripts/team_codex_ma.sh`: legacy codex-ma backend bridge
+- `scripts/team_bus.py`: SQLite bus (`init`, `send`, `tail`, `status`, mailbox/control)
+- `scripts/team_fs.py`: filesystem team config/mailbox/state/runtime core
+- `scripts/team_mailbox.sh`: unread mailbox + pending control requests
+- `scripts/team_control.sh`: plan/shutdown/permission request-response helper
+- `scripts/team_dashboard.sh`: single-terminal live dashboard (all tmux panes)
+- `scripts/team_pulse.sh`: automatic heartbeat from pane content changes
+- `scripts/team_inprocess_agent.py`: in-process teammate poll/execute loop
+- `scripts/install_global.sh`: global install + launchers
 
 ## IDE Viewer Extension
 
-Use `extensions/antigravity-codex-teams-viewer` to watch the same TUI output inside OpenVSX-based IDEs.
+Use `extensions/antigravity-codex-teams-viewer` to watch tmux pane outputs and bus messages in OpenVSX-based IDEs.
 
-## Failure Handling
+Bridge integration:
+- `teamcreate` / `run` / `up` writes `.codex-teams/.viewer-session.json`
+- Viewer extension can auto-follow this bridge (`useSkillBridge=true`) so skill usage in IDE chat is reflected without opening a separate terminal panel.
 
-- If tmux session already exists, rerun with replacement options.
-- If codex-ma config is missing, run `codex-ma init` first.
-- If model is unresolved, execution falls back to Codex default config behavior.
+## Legacy Backend
+
+If you need previous codex-ma flow:
+```bash
+codex-teams-ma run --task "<task>"
+```

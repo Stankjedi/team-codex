@@ -14,7 +14,7 @@ ONCE="false"
 
 usage() {
   cat <<'EOF'
-Terminal dashboard for codex-teams/codex-ma sessions.
+Terminal dashboard for codex-teams sessions.
 
 Usage:
   team_dashboard.sh [options]
@@ -24,13 +24,13 @@ Options:
   --repo PATH       repo root that owns .codex-teams (default: current directory)
   --room NAME       bus room name (default: main)
   --interval SEC    refresh interval seconds (default: 1)
-  --lines N         pane lines captured per role (default: 14)
+  --lines N         pane lines captured per pane (default: 14)
   --messages N      recent bus messages to show (default: 14)
   --once            render one frame and exit
   -h, --help        show help
 
 Examples:
-  team_dashboard.sh --session teams-rt-test --repo /path/to/repo --room dev
+  team_dashboard.sh --session codex-fleet --repo /path/to/repo --room main
   team_dashboard.sh --session codex-fleet --messages 25 --lines 20
 EOF
 }
@@ -92,7 +92,6 @@ fi
 
 normalize_repo_path() {
   local p="$1"
-  # Convert Windows paths (e.g., C:\Users\me or C:/Users/me) to WSL paths.
   if [[ "$p" =~ ^[A-Za-z]:[\\/].* ]]; then
     if command -v wslpath >/dev/null 2>&1; then
       wslpath -a "$p"
@@ -107,19 +106,52 @@ normalize_repo_path() {
   printf '%s\n' "$p"
 }
 
-REPO="$(normalize_repo_path "$REPO")"
-REPO="$(cd "$REPO" && pwd)"
-DB="$REPO/.codex-teams/$SESSION/bus.sqlite"
+find_repo_with_bus_db() {
+  local start="$1"
+  local path
+  path="$(cd "$start" 2>/dev/null && pwd || true)"
+  if [[ -z "$path" ]]; then
+    return 1
+  fi
 
-if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required" >&2
-  exit 2
-fi
+  while true; do
+    if [[ -f "$path/.codex-teams/$SESSION/bus.sqlite" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+    if [[ "$path" == "/" ]]; then
+      break
+    fi
+    path="$(dirname "$path")"
+  done
+  return 1
+}
 
-if ! tmux has-session -t "$SESSION" >/dev/null 2>&1; then
-  echo "tmux session not found: $SESSION" >&2
-  exit 2
-fi
+discover_repo_from_tmux_session() {
+  local pane_path
+  while IFS= read -r pane_path; do
+    [[ -z "$pane_path" ]] && continue
+
+    if inferred="$(find_repo_with_bus_db "$pane_path" 2>/dev/null)"; then
+      printf '%s\n' "$inferred"
+      return 0
+    fi
+
+    if command -v git >/dev/null 2>&1 && git -C "$pane_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local common_dir
+      common_dir="$(git -C "$pane_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+      if [[ -n "$common_dir" ]]; then
+        local common_root
+        common_root="$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd || true)"
+        if [[ -n "$common_root" && -f "$common_root/.codex-teams/$SESSION/bus.sqlite" ]]; then
+          printf '%s\n' "$common_root"
+          return 0
+        fi
+      fi
+    fi
+  done < <(tmux list-panes -s -t "$SESSION" -F "#{pane_current_path}" 2>/dev/null || true)
+  return 1
+}
 
 render_messages() {
   if [[ ! -f "$DB" ]]; then
@@ -128,7 +160,8 @@ render_messages() {
   fi
 
   python3 - "$DB" "$ROOM" "$MSG_LIMIT" <<'PY'
-import sqlite3, sys
+import sqlite3
+import sys
 
 db, room, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
 conn = sqlite3.connect(db)
@@ -173,12 +206,218 @@ render_section_header() {
   render_rule "-"
 }
 
-render_pane() {
+pane_label() {
   local window_name="$1"
-  echo ""
-  render_section_header "$window_name"
-  tmux capture-pane -pt "$SESSION:$window_name.0" -S "-$LINES" 2>/dev/null || echo "(unavailable)"
+  local pane_index="$2"
+  local pane_title="$3"
+  if [[ -n "$pane_title" ]]; then
+    printf '%s\n' "$pane_title"
+    return 0
+  fi
+  printf '%s.%s\n' "$window_name" "$pane_index"
 }
+
+render_one_pane() {
+  local window_name="$1"
+  local pane_index="$2"
+  local pane_id="$3"
+  local pane_title="$4"
+  local pane_cmd="$5"
+
+  local title
+  title="$(pane_label "$window_name" "$pane_index" "$pane_title")"
+
+  echo ""
+  render_section_header "$title"
+  echo "pane=$pane_id window=$window_name cmd=$pane_cmd"
+  tmux capture-pane -pt "$SESSION:$window_name.$pane_index" -S "-$LINES" 2>/dev/null || echo "(unavailable)"
+}
+
+render_tmux_panes() {
+  local window_name
+  while IFS= read -r window_name; do
+    [[ -z "$window_name" ]] && continue
+    while IFS='|' read -r pane_index pane_id pane_title pane_cmd; do
+      [[ -z "$pane_id" ]] && continue
+      render_one_pane "$window_name" "$pane_index" "$pane_id" "$pane_title" "$pane_cmd"
+    done < <(tmux list-panes -t "$SESSION:$window_name" -F "#{pane_index}|#{pane_id}|#{pane_title}|#{pane_current_command}" 2>/dev/null || true)
+  done < <(tmux list-windows -t "$SESSION" -F "#{window_name}")
+}
+
+render_inprocess_agents() {
+  local runtime_file="$REPO/.codex-teams/$SESSION/runtime.json"
+  local log_dir="$REPO/.codex-teams/$SESSION/logs"
+
+  if [[ ! -f "$runtime_file" ]]; then
+    echo "(no runtime state: $runtime_file)"
+    return 0
+  fi
+
+  local entries
+  entries="$(python3 - "$runtime_file" <<'PY'
+import json
+import sys
+
+runtime_path = sys.argv[1]
+try:
+    with open(runtime_path, "r", encoding="utf-8") as f:
+        runtime = json.load(f)
+except Exception:
+    raise SystemExit(0)
+
+agents = runtime.get("agents", {})
+if not isinstance(agents, dict):
+    raise SystemExit(0)
+
+for name in sorted(agents.keys()):
+    rec = agents.get(name, {})
+    if not isinstance(rec, dict):
+        continue
+    if str(rec.get("backend", "")) != "in-process":
+        continue
+    status = str(rec.get("status", ""))
+    pid = str(rec.get("pid", 0))
+    print(f"{name}|{status}|{pid}")
+PY
+)"
+
+  if [[ -z "$entries" ]]; then
+    echo "(no in-process teammates)"
+    return 0
+  fi
+
+  while IFS='|' read -r agent status pid; do
+    [[ -z "$agent" ]] && continue
+    echo ""
+    render_section_header "$agent"
+    echo "backend=in-process status=$status pid=$pid"
+    local log_file="$log_dir/$agent.log"
+    if [[ -f "$log_file" ]]; then
+      tail -n "$LINES" "$log_file"
+    else
+      echo "(log missing: $log_file)"
+    fi
+  done <<< "$entries"
+}
+
+render_fs_unread_mailbox() {
+  local config_file="$REPO/.codex-teams/$SESSION/config.json"
+  local inbox_root="$REPO/.codex-teams/$SESSION/inboxes"
+  if [[ ! -f "$config_file" ]]; then
+    echo "(no team config: $config_file)"
+    return 0
+  fi
+  python3 - "$config_file" "$inbox_root" <<'PY'
+import json
+import os
+import sys
+
+config_file, inbox_root = sys.argv[1], sys.argv[2]
+try:
+    with open(config_file, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    print("(failed to read team config)")
+    raise SystemExit(0)
+
+members = [m for m in cfg.get("members", []) if isinstance(m, dict)]
+if not members:
+    print("(no members)")
+    raise SystemExit(0)
+
+for member in members:
+    name = str(member.get("name", ""))
+    if not name:
+        continue
+    inbox_file = os.path.join(inbox_root, f"{name}.json")
+    unread = []
+    if os.path.isfile(inbox_file):
+        try:
+            with open(inbox_file, "r", encoding="utf-8") as f:
+                inbox = json.load(f)
+            msgs = inbox.get("messages", [])
+            if isinstance(msgs, list):
+                unread = [m for m in msgs if isinstance(m, dict) and not bool(m.get("read", False))]
+        except Exception:
+            unread = []
+    if not unread:
+        print(f"{name}: unread=0")
+        continue
+    latest = unread[-1]
+    print(
+        f"{name}: unread={len(unread)} "
+        f"latest={latest.get('type','')} from={latest.get('from','')} "
+        f"summary={latest.get('summary','')}"
+    )
+PY
+}
+
+render_fs_pending_controls() {
+  local control_file="$REPO/.codex-teams/$SESSION/control.json"
+  if [[ ! -f "$control_file" ]]; then
+    echo "(no control store: $control_file)"
+    return 0
+  fi
+  python3 - "$control_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        control = json.load(f)
+except Exception:
+    print("(failed to read control store)")
+    raise SystemExit(0)
+
+reqs = control.get("requests", {})
+if not isinstance(reqs, dict) or not reqs:
+    print("(no control requests)")
+    raise SystemExit(0)
+
+pending = []
+for req in reqs.values():
+    if not isinstance(req, dict):
+        continue
+    if str(req.get("status", "")) != "pending":
+        continue
+    pending.append(req)
+
+if not pending:
+    print("(no pending requests)")
+    raise SystemExit(0)
+
+pending.sort(key=lambda r: str(r.get("created_ts", "")))
+for req in pending[-20:]:
+    print(
+        f"request_id={req.get('request_id','')} type={req.get('req_type','')} "
+        f"from={req.get('sender','')} to={req.get('recipient','')} created={req.get('created_ts','')}"
+    )
+    print(f"body={req.get('body','')}")
+PY
+}
+
+REPO="$(normalize_repo_path "$REPO")"
+REPO="$(cd "$REPO" && pwd)"
+DB="$REPO/.codex-teams/$SESSION/bus.sqlite"
+ORIGINAL_REPO="$REPO"
+
+TMUX_AVAILABLE="false"
+TMUX_INSTALLED="false"
+if command -v tmux >/dev/null 2>&1; then
+  TMUX_INSTALLED="true"
+  if tmux has-session -t "$SESSION" >/dev/null 2>&1; then
+    TMUX_AVAILABLE="true"
+  fi
+fi
+
+if [[ "$TMUX_AVAILABLE" == "true" && ! -f "$DB" ]]; then
+  auto_repo="$(discover_repo_from_tmux_session || true)"
+  if [[ -n "$auto_repo" && "$auto_repo" != "$REPO" ]]; then
+    REPO="$auto_repo"
+    DB="$REPO/.codex-teams/$SESSION/bus.sqlite"
+  fi
+fi
 
 while true; do
   if [[ -t 1 ]]; then
@@ -186,6 +425,7 @@ while true; do
   else
     printf '\n'
   fi
+
   echo "Codex Teams Dashboard"
   echo "session=$SESSION room=$ROOM repo=$REPO"
   echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
@@ -195,16 +435,39 @@ while true; do
     TEAM_DB="$DB" "$STATUS_SCRIPT" --room "$ROOM" || true
   else
     echo "db missing: $DB"
+    if [[ "$REPO" != "$ORIGINAL_REPO" ]]; then
+      echo "note: repo path auto-corrected from $ORIGINAL_REPO to $REPO based on tmux session"
+      echo "hint: set dashboard repo/session to match the active run"
+    fi
   fi
 
   echo ""
   render_section_header "Recent Messages"
   render_messages
 
-  while IFS= read -r win; do
-    [[ -z "$win" ]] && continue
-    render_pane "$win"
-  done < <(tmux list-windows -t "$SESSION" -F "#{window_name}")
+  echo ""
+  render_section_header "filesystem inbox (unread)"
+  render_fs_unread_mailbox
+
+  echo ""
+  render_section_header "control queue (pending)"
+  render_fs_pending_controls
+
+  if [[ "$TMUX_AVAILABLE" == "true" ]]; then
+    render_tmux_panes
+  else
+    echo ""
+    render_section_header "tmux"
+    if [[ "$TMUX_INSTALLED" == "true" ]]; then
+      echo "session not found: $SESSION (in-process backend may be running without tmux panes)"
+    else
+      echo "tmux not installed; showing bus/runtime data only"
+    fi
+  fi
+
+  echo ""
+  render_section_header "in-process teammates"
+  render_inprocess_agents
 
   if [[ "$ONCE" == "true" ]]; then
     break
