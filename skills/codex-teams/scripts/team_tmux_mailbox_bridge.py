@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -17,6 +18,17 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FS_PATH = SCRIPT_DIR / "team_fs.py"
+NON_ACTIONABLE_PROMPT_TYPES = {
+    "status",
+    "idle_notification",
+    "system",
+    "plan_approval_response",
+    "permission_response",
+    "shutdown_response",
+    "shutdown_approved",
+    "shutdown_rejected",
+    "mode_set_response",
+}
 
 
 def run_cmd(cmd: list[str]) -> tuple[int, str]:
@@ -116,6 +128,32 @@ def trim_text(raw: str, limit: int = 1000) -> str:
     return text[: limit - 3] + "..."
 
 
+def parse_bool(raw: str) -> bool:
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def summary_indicates_done(summary: str) -> bool:
+    text = str(summary or "").strip().lower()
+    if not text:
+        return False
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", text) if tok]
+    if not tokens:
+        return False
+    done_tokens = {"done", "complete", "completed", "finish", "finished"}
+    if "not" in tokens and any(tok in done_tokens for tok in tokens):
+        return False
+    return any(tok in done_tokens for tok in tokens)
+
+
+def should_inject_prompt_for_message(message: dict) -> bool:
+    msg_type = str(message.get("type", "message")).strip() or "message"
+    if msg_type in NON_ACTIONABLE_PROMPT_TYPES:
+        return False
+    if msg_type.endswith("_response"):
+        return False
+    return True
+
+
 def reply_kind_for(msg_type: str) -> str:
     if msg_type == "question":
         return "answer"
@@ -165,6 +203,83 @@ def inject_prompt(pane_id: str, prompt: str) -> bool:
     return rc == 0
 
 
+def runtime_agent_record(runtime: dict, agent: str) -> dict:
+    agents = runtime.get("agents", {})
+    if not isinstance(agents, dict):
+        return {}
+    rec = agents.get(agent)
+    return rec if isinstance(rec, dict) else {}
+
+
+def detect_done_worker_from_message(*, agent: str, lead: str, message: dict) -> str:
+    if agent != lead:
+        return ""
+    if str(message.get("type", "")).strip() != "status":
+        return ""
+    sender = str(message.get("from", "")).strip()
+    if not sender.startswith("worker-"):
+        return ""
+    recipient = str(message.get("recipient", "")).strip()
+    if recipient and recipient != lead:
+        return ""
+    if not summary_indicates_done(str(message.get("summary", ""))):
+        return ""
+    return sender
+
+
+def kill_worker_tmux_target(*, tmux_session: str, pane_id: str, window_name: str) -> bool:
+    if pane_id:
+        rc, _ = run_cmd(["tmux", "kill-pane", "-t", pane_id])
+        if rc == 0:
+            return True
+    if window_name:
+        rc, _ = run_cmd(["tmux", "kill-window", "-t", f"{tmux_session}:{window_name}"])
+        if rc == 0:
+            return True
+    return False
+
+
+def auto_shutdown_done_worker(
+    *,
+    repo: str,
+    session: str,
+    tmux_session: str,
+    runtime: dict,
+    worker: str,
+) -> bool:
+    rec = runtime_agent_record(runtime, worker)
+    if not rec:
+        return False
+    if str(rec.get("backend", "")).strip() != "tmux":
+        return False
+    if str(rec.get("status", "")).strip() != "running":
+        return False
+    pane_id = str(rec.get("paneId", "")).strip()
+    window_name = str(rec.get("window", "")).strip()
+    if not pane_id and not window_name:
+        return False
+
+    if not kill_worker_tmux_target(tmux_session=tmux_session, pane_id=pane_id, window_name=window_name):
+        return False
+
+    fs_cmd(
+        [
+            "runtime-mark",
+            "--repo",
+            repo,
+            "--session",
+            session,
+            "--agent",
+            worker,
+            "--status",
+            "terminated",
+        ]
+    )
+    rec["status"] = "terminated"
+    rec["updatedAt"] = int(time.time() * 1000)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inject unread codex-teams mailbox messages into tmux panes")
     parser.add_argument("--repo", required=True)
@@ -172,11 +287,13 @@ def main() -> int:
     parser.add_argument("--room", default="main")
     parser.add_argument("--tmux-session", default="")
     parser.add_argument("--lead-name", default="lead")
+    parser.add_argument("--auto-kill-done-workers", default="true")
     parser.add_argument("--poll-ms", type=int, default=800)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
 
     tmux_session = args.tmux_session.strip() or args.session
+    auto_kill_done_workers = parse_bool(args.auto_kill_done_workers)
     runtime_path = Path(args.repo).resolve() / ".codex-teams" / args.session / "runtime.json"
 
     if args.poll_ms < 100:
@@ -196,15 +313,33 @@ def main() -> int:
                 idx = row.get("index")
                 if not isinstance(idx, int):
                     continue
-                prompt = build_prompt(
-                    agent=agent,
-                    lead=args.lead_name,
-                    room=args.room,
-                    session=args.session,
-                    message=row,
-                )
-                if inject_prompt(pane_id, prompt):
+                done_worker = ""
+                if auto_kill_done_workers:
+                    done_worker = detect_done_worker_from_message(
+                        agent=agent,
+                        lead=args.lead_name,
+                        message=row,
+                    )
+                if should_inject_prompt_for_message(row):
+                    prompt = build_prompt(
+                        agent=agent,
+                        lead=args.lead_name,
+                        room=args.room,
+                        session=args.session,
+                        message=row,
+                    )
+                    if inject_prompt(pane_id, prompt):
+                        marked_indexes.append(idx)
+                else:
                     marked_indexes.append(idx)
+                if done_worker:
+                    auto_shutdown_done_worker(
+                        repo=args.repo,
+                        session=args.session,
+                        tmux_session=tmux_session,
+                        runtime=runtime,
+                        worker=done_worker,
+                    )
             mark_read(args.repo, args.session, agent, marked_indexes)
 
         time.sleep(max(0.1, args.poll_ms / 1000.0))

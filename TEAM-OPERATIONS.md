@@ -2,13 +2,18 @@
 
 ## Topology
 - `lead` x 1
-- `worker` x N (auto-variable)
+- `worker` x 2 (default)
 - `utility` x 1
 
 ## Staffing Policy
+- 기본 worker 수는 2
 - `--workers auto`에서 worker pool을 2~4로 자동 산정
 - worker 최소 인원은 2명으로 강제
 - utility는 고정 1명
+
+## Worktree Policy
+- lead는 루트 레포가 아니라 전용 worktree(`.worktrees/lead-1` 기본)에서 실행한다.
+- worker/utility는 `.worktrees/<agent>`를 사용한다.
 
 ## Worker Scale-Out Rule
 - 추가 워커가 필요하면 반드시 `worker-N` 워크트리를 먼저 포함한 토폴로지로 실행한다.

@@ -27,6 +27,17 @@ import team_fs  # noqa: E402
 STOP = False
 PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions", "plan", "delegate", "dontAsk"}
 SYSTEM_SENDER_NAMES = {"system", "monitor", "orchestrator"}
+NON_ACTIONABLE_WORK_TYPES = {
+    "status",
+    "idle_notification",
+    "system",
+    "plan_approval_response",
+    "permission_response",
+    "shutdown_response",
+    "shutdown_approved",
+    "shutdown_rejected",
+    "mode_set_response",
+}
 
 
 def on_signal(signum: int, _frame: object) -> None:
@@ -92,6 +103,15 @@ def parse_meta(raw_meta: object) -> dict:
     return {}
 
 
+def is_actionable_work_message(message: dict) -> bool:
+    msg_type = str(message.get("type", "message")).strip() or "message"
+    if msg_type in NON_ACTIONABLE_WORK_TYPES:
+        return False
+    if msg_type.endswith("_response"):
+        return False
+    return True
+
+
 def dispatch_message(
     *,
     fs_path: Path,
@@ -133,6 +153,8 @@ def collect_collaboration_targets(messages: list[dict], *, self_agent: str) -> d
     for msg in messages:
         sender = str(msg.get("from", "")).strip()
         if not sender or sender == self_agent or sender in SYSTEM_SENDER_NAMES:
+            continue
+        if not is_actionable_work_message(msg):
             continue
         msg_type = str(msg.get("type", "message")).strip() or "message"
         bucket = targets.setdefault(sender, set())
@@ -470,7 +492,8 @@ def handle_control_messages(
             )
             continue
 
-        work_messages.append(msg)
+        if is_actionable_work_message(msg):
+            work_messages.append(msg)
 
     return should_shutdown, work_messages
 

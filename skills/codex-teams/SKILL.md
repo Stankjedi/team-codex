@@ -32,12 +32,12 @@ codex-teams setup --repo <repo>
 
 3. Create team context (`TeamCreate` equivalent):
 ```bash
-codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo task force"
+codex-teams teamcreate --session codex-fleet --workers 2 --description "Repo task force"
 ```
 
 4. Run swarm:
 ```bash
-codex-teams run --task "<user task>" --session codex-fleet --workers auto --tmux-layout split --dashboard
+codex-teams run --task "<user task>" --session codex-fleet --tmux-layout split --dashboard
 ```
 기본 모드(옵션 생략 시)는 `in-process-shared`입니다.
 
@@ -46,10 +46,11 @@ In-process backend example:
 codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process-shared --no-attach
 ```
 
-Git binary override example (utility push/merge path):
+Git default is WSL `git` (recommended to reduce `conhost.exe` overhead). Optional Windows Git override:
 ```bash
 codex-teams run --task "<user task>" --session codex-fleet --git-bin "/mnt/c/Program Files/Git/cmd/git.exe"
 ```
+`--repo`, `--config`, `--git-bin`는 `C:\...` 입력도 자동으로 WSL 경로로 정규화합니다.
 
 5. Monitor bus directly:
 ```bash
@@ -76,9 +77,10 @@ codex-teams sendmessage --session codex-fleet --type message --from lead --to wo
   - non-interactive 실행: `in-process`
   - interactive + tmux 내부: `tmux`
   - interactive + tmux 외부: `in-process`
-- 작업 디렉터리 규칙: `lead`는 루트 레포, `worker/utility`는 `.worktrees/<agent>`
+- 작업 디렉터리 규칙: `lead`는 `.worktrees/lead-1`(기본), `worker/utility`는 `.worktrees/<agent>`
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
+- 기본 worker pool: 2
 - `--workers auto`: 태스크 난이도에 따라 `worker pool`을 2~4 범위에서 자동 선택
 - 워커 증설 원칙: 추가 워커가 필요하면 `--workers <N>`(또는 `auto`)로 재실행해 `.worktrees/worker-1..N`을 먼저 맞춘 뒤 작업을 분배
 - 워커/유틸 처리 결과는 리더뿐 아니라 질문 보낸 동료에게도 자동 회신되어 지속 협업 루프를 유지
