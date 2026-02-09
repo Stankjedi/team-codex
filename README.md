@@ -200,7 +200,3 @@ export PATH="/mnt/c/Program Files/Git/cmd:$PATH"
 ```text
 [$codex-teams](~/.codex/skills/codex-teams/SKILL.md) 사용해서 ...
 ```
-
-## 라이선스
-
-Apache License 2.0 (`LICENSE`)
