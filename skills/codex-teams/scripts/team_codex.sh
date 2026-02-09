@@ -12,6 +12,7 @@ DASHBOARD_SCRIPT="$SCRIPT_DIR/team_dashboard.sh"
 PULSE_SCRIPT="$SCRIPT_DIR/team_pulse.sh"
 TAIL_SCRIPT="$SCRIPT_DIR/team_tail.sh"
 INPROCESS_AGENT="$SCRIPT_DIR/team_inprocess_agent.py"
+INPROCESS_HUB="$SCRIPT_DIR/team_inprocess_hub.py"
 LEGACY_SCRIPT="$SCRIPT_DIR/team_codex_ma.sh"
 VIEWER_BRIDGE_FILE=".codex-teams/.viewer-session.json"
 
@@ -98,7 +99,7 @@ Common options:
   --worker-model MODEL    Worker model override
 
 Backend options:
-  --teammate-mode MODE    auto|tmux|in-process (default: auto)
+  --teammate-mode MODE    auto|tmux|in-process|in-process-shared (default: auto)
   --tmux-layout MODE      split|window (default: split)
   --permission-mode MODE  default|acceptEdits|bypassPermissions|plan|delegate|dontAsk
   --plan-mode-required    Mark teammate config as plan-mode required
@@ -417,7 +418,7 @@ load_config_or_defaults() {
   case "$USE_BASE_WIP" in true|false) ;; *) abort "USE_BASE_WIP must be true/false" ;; esac
   case "$ALLOW_DIRTY" in true|false) ;; *) abort "ALLOW_DIRTY must be true/false" ;; esac
   case "$KILL_EXISTING_SESSION" in true|false) ;; *) abort "KILL_EXISTING_SESSION must be true/false" ;; esac
-  case "$TEAMMATE_MODE" in auto|tmux|in-process) ;; *) abort "TEAMMATE_MODE must be auto|tmux|in-process" ;; esac
+  case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "TEAMMATE_MODE must be auto|tmux|in-process|in-process-shared" ;; esac
   case "$TMUX_LAYOUT" in split|window) ;; *) abort "TMUX_LAYOUT must be split|window" ;; esac
   case "$PLAN_MODE_REQUIRED" in true|false) ;; *) abort "PLAN_MODE_REQUIRED must be true|false" ;; esac
   case "$AUTO_DELEGATE" in true|false) ;; *) abort "AUTO_DELEGATE must be true|false" ;; esac
@@ -862,6 +863,37 @@ spawn_inprocess_backend() {
   done
 }
 
+spawn_inprocess_shared_backend() {
+  require_cmd nohup
+  mkdir -p "$LOG_DIR"
+
+  fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$TEAM_LEAD_NAME" --backend in-process-shared --status idle --pid 0 --window in-process-shared >/dev/null
+
+  local hub_log="$LOG_DIR/inprocess-hub.log"
+  local args=(
+    python3 "$INPROCESS_HUB"
+    --repo "$REPO"
+    --session "$TMUX_SESSION"
+    --room "$ROOM"
+    --prefix "$PREFIX"
+    --count "$COUNT"
+    --worktrees-root "$WORKTREES_ROOT"
+    --profile "$WORKER_PROFILE"
+    --model "$WORKER_MODEL"
+    --codex-bin "$CODEX_BIN"
+    --permission-mode "$PERMISSION_MODE"
+  )
+  if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
+    args+=(--plan-mode-required)
+  fi
+
+  nohup "${args[@]}" >"$hub_log" 2>&1 &
+  local pid=$!
+
+  python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
+    --body "spawned in-process shared hub pid=$pid workers=$COUNT log=$hub_log" >/dev/null
+}
+
 launch_aux_windows() {
   if [[ "$RESOLVED_BACKEND" != "tmux" ]]; then
     return 0
@@ -893,7 +925,7 @@ launch_aux_windows() {
   fi
   tmux select-pane -t "$TMUX_SESSION:$PULSE_WINDOW.0" -T "pulse" >/dev/null 2>&1 || true
   tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" \
-    "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --prefix '$PREFIX' --count '$COUNT'" C-m
+    "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --prefix '$PREFIX' --count '$COUNT' --lead-name '$TEAM_LEAD_NAME'" C-m
 }
 
 worker_focus_instruction() {
@@ -1010,6 +1042,8 @@ print_start_summary() {
   fi
   if [[ "$RESOLVED_BACKEND" == "in-process" ]]; then
     echo "- logs: $LOG_DIR/<agent>.log"
+  elif [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
+    echo "- logs: $LOG_DIR/inprocess-hub.log"
   fi
   echo "- status: TEAM_DB='$DB' '$STATUS' --room '$ROOM'"
   echo "- mailbox: TEAM_DB='$DB' '$MAILBOX' --repo '$REPO' --session '$TMUX_SESSION' inbox <agent> --unread"
@@ -1039,7 +1073,11 @@ run_swarm() {
     fi
     launch_aux_windows
   else
-    spawn_inprocess_backend
+    if [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
+      spawn_inprocess_shared_backend
+    else
+      spawn_inprocess_backend
+    fi
   fi
 
   write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
@@ -1136,6 +1174,9 @@ apply_shutdown_target() {
     fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
   elif [[ "$backend" == "in-process" ]]; then
     fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --signal term >/dev/null || true
+  elif [[ "$backend" == "in-process-shared" ]]; then
+    # Shared hub manages per-worker shutdown via mailbox/control flow.
+    fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
   elif [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
     kill "$pid" >/dev/null 2>&1 || true
     fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
@@ -1327,6 +1368,12 @@ cmd_sendmessage() {
 
   if [[ "$msg_type" == "broadcast" ]]; then
     recipient="all"
+  fi
+  if [[ "$msg_type" == "message" && "$recipient" == "all" ]]; then
+    msg_type="broadcast"
+    if [[ -z "$MESSAGE_KIND" ]]; then
+      kind="broadcast"
+    fi
   fi
 
   case "$msg_type" in
@@ -1666,7 +1713,7 @@ parse_args() {
   if ! [[ "$DASHBOARD_MESSAGES" =~ ^[0-9]+$ ]] || [[ "$DASHBOARD_MESSAGES" -lt 1 ]]; then
     abort "--dashboard-messages must be >= 1"
   fi
-  case "$TEAMMATE_MODE" in auto|tmux|in-process) ;; *) abort "--teammate-mode must be auto|tmux|in-process" ;; esac
+  case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "--teammate-mode must be auto|tmux|in-process|in-process-shared" ;; esac
   case "$TMUX_LAYOUT" in split|window) ;; *) abort "--tmux-layout must be split|window" ;; esac
 }
 

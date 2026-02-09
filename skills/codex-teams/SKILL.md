@@ -29,6 +29,11 @@ codex-teams run --task "<user task>" --session codex-fleet --teammate-mode tmux 
 codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process --no-attach
 ```
 
+Or run shared in-process hub (single supervisor process):
+```bash
+codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process-shared --no-attach
+```
+
 5. Monitor bus directly:
 ```bash
 TEAM_DB=.codex-teams/codex-fleet/bus.sqlite ./scripts/team_tail.sh --all monitor
@@ -50,6 +55,7 @@ codex-teams sendmessage --session codex-fleet --type message --from director --t
 - `--teammate-mode auto`: TTY/tmux 환경 기준 자동 선택
 - `--teammate-mode tmux`: tmux 세션에 director/worker 패널 생성
 - `--teammate-mode in-process`: 파일 mailbox 폴링 루프 기반 워커 실행
+- `--teammate-mode in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
 
@@ -106,6 +112,7 @@ Model precedence (highest first):
 - `scripts/team_dashboard.sh`: single-terminal live dashboard (all tmux panes)
 - `scripts/team_pulse.sh`: automatic heartbeat from pane content changes
 - `scripts/team_inprocess_agent.py`: in-process teammate poll/execute loop
+- `scripts/team_inprocess_hub.py`: shared in-process multi-worker hub loop
 - `scripts/install_global.sh`: global install + launchers
 
 ## IDE Viewer Extension

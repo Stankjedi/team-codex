@@ -18,6 +18,7 @@
   - `auto`
   - `tmux` (`--tmux-layout split|window`)
   - `in-process` (filesystem mailbox poll loop)
+  - `in-process-shared` (single-process hub running multiple teammate loops)
 - `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
 - emits startup `system` and worker-scaling `status` messages
 - default auto-delegates initial task from `director` to each `pair-N` with role-specific execution prompt

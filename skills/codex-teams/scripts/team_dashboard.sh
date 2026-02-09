@@ -273,7 +273,7 @@ for name in sorted(agents.keys()):
     rec = agents.get(name, {})
     if not isinstance(rec, dict):
         continue
-    if str(rec.get("backend", "")) != "in-process":
+    if str(rec.get("backend", "")) not in {"in-process", "in-process-shared"}:
         continue
     status = str(rec.get("status", ""))
     pid = str(rec.get("pid", 0))

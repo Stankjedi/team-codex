@@ -10,6 +10,7 @@ WINDOW="swarm"
 ROOM="main"
 PREFIX="pair"
 COUNT="4"
+LEAD_NAME="director"
 LINES="20"
 INTERVAL="8"
 MIN_GAP="45"
@@ -28,6 +29,7 @@ Options:
   --room NAME       bus room (default: main)
   --prefix NAME     worker pane prefix (default: pair)
   --count N         worker count ceiling (default: 4)
+  --lead-name NAME  leader pane title/name (default: director)
   --lines N         pane lines sampled for hash (default: 20)
   --interval SEC    polling interval (default: 8)
   --min-gap SEC     min seconds between emits per agent (default: 45)
@@ -59,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --count)
       COUNT="$2"
+      shift 2
+      ;;
+    --lead-name)
+      LEAD_NAME="$2"
       shift 2
       ;;
     --lines)
@@ -118,8 +124,8 @@ fi
 
 agent_from_title() {
   local title="$1"
-  if [[ "$title" == "director" ]]; then
-    printf 'director\n'
+  if [[ "$title" == "$LEAD_NAME" ]]; then
+    printf '%s\n' "$LEAD_NAME"
     return 0
   fi
   if [[ "$title" =~ ^${PREFIX}-([0-9]+)$ ]]; then
@@ -135,7 +141,7 @@ agent_from_title() {
 touch_agent() {
   local agent="$1"
   local role="worker"
-  if [[ "$agent" == "director" ]]; then
+  if [[ "$agent" == "$LEAD_NAME" ]]; then
     role="director"
   fi
   python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role "$role" >/dev/null 2>&1 || true
@@ -144,7 +150,7 @@ touch_agent() {
 send_pulse() {
   local agent="$1"
   local body="$2"
-  python3 "$BUS" --db "$DB" send --room "$ROOM" --from "$agent" --to director --kind status --body "$body" >/dev/null 2>&1 || true
+  python3 "$BUS" --db "$DB" send --room "$ROOM" --from "$agent" --to "$LEAD_NAME" --kind status --body "$body" >/dev/null 2>&1 || true
 }
 
 hash_pane() {

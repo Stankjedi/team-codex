@@ -54,12 +54,14 @@ codex-teams run --session codex-fleet --task "작업 내용" --teammate-mode aut
 codex-teams run --session codex-fleet --task "작업 내용" --teammate-mode tmux --tmux-layout split --dashboard
 codex-teams run --session codex-fleet --task "작업 내용" --teammate-mode tmux --tmux-layout window
 codex-teams run --session codex-fleet --task "작업 내용" --teammate-mode in-process --no-attach
+codex-teams run --session codex-fleet --task "작업 내용" --teammate-mode in-process-shared --no-attach
 codex-teams run --session codex-fleet --task "작업 내용" --no-auto-delegate
 ```
 
 - `auto`: 환경에 따라 `tmux` 또는 `in-process` 선택
 - `tmux`: 같은 TUI에서 `director + pair-N` 분할/창 실행
 - `in-process`: 파일 메일박스 폴링 루프 기반 워커 프로세스 실행
+- `in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행
 - 기본값으로 초기 태스크를 워커별 하위 태스크로 자동 분할(`--auto-delegate`), 필요 시 `--no-auto-delegate`로 비활성화
 
 ### 3) SendMessage 스키마

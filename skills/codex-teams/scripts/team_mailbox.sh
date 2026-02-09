@@ -191,8 +191,39 @@ PY
       [[ "$json_out" == "true" ]] && args+=(--json)
       python3 "$FS" "${args[@]}"
       if [[ "$mark_read" == "true" ]]; then
-        if [[ "$unread" == "true" ]]; then
-          python3 "$FS" mailbox-mark-read --repo "$REPO" --session "$SESSION" --agent "$agent" --all >/dev/null
+        mark_source_args=(mailbox-read --repo "$REPO" --session "$SESSION" --agent "$agent" --json --limit "$limit")
+        [[ "$unread" == "true" ]] && mark_source_args+=(--unread)
+        raw_json="$(python3 "$FS" "${mark_source_args[@]}")"
+        mapfile -t mark_indexes < <(python3 - "$raw_json" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1]
+if not raw.strip():
+    raise SystemExit(0)
+try:
+    rows = json.loads(raw)
+except json.JSONDecodeError:
+    raise SystemExit(0)
+if not isinstance(rows, list):
+    raise SystemExit(0)
+for row in rows:
+    if not isinstance(row, dict):
+        continue
+    idx = row.get("index")
+    if isinstance(idx, int) and idx >= 0:
+        print(idx)
+PY
+)
+        if [[ "${#mark_indexes[@]}" -gt 0 ]]; then
+          mark_args=(mailbox-mark-read --repo "$REPO" --session "$SESSION" --agent "$agent")
+          for idx in "${mark_indexes[@]}"; do
+            mark_args+=(--index "$idx")
+          done
+          python3 "$FS" "${mark_args[@]}" >/dev/null
+        fi
+        if [[ "$json_out" != "true" ]]; then
+          echo "marked_read=${#mark_indexes[@]}"
         fi
       fi
     else
@@ -231,8 +262,32 @@ PY
       if [[ "$all" == "true" ]]; then
         args+=(--all)
       elif [[ -n "$up_to" ]]; then
-        # fs mode has explicit ids/all; emulate up-to by marking all for now
-        args+=(--all)
+        raw_json="$(python3 "$FS" mailbox-read --repo "$REPO" --session "$SESSION" --agent "$agent" --json --limit 1000000)"
+        mapfile -t up_indexes < <(python3 - "$raw_json" "$up_to" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1]
+up_to = int(sys.argv[2])
+if not raw.strip():
+    raise SystemExit(0)
+try:
+    rows = json.loads(raw)
+except json.JSONDecodeError:
+    raise SystemExit(0)
+if not isinstance(rows, list):
+    raise SystemExit(0)
+for row in rows:
+    if not isinstance(row, dict):
+        continue
+    idx = row.get("index")
+    if isinstance(idx, int) and 0 <= idx <= up_to:
+        print(idx)
+PY
+)
+        for idx in "${up_indexes[@]}"; do
+          args+=(--index "$idx")
+        done
       else
         for id in "${ids[@]}"; do
           args+=(--index "$id")

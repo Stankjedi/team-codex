@@ -170,6 +170,7 @@ def handle_control_messages(
         meta = parse_meta(msg.get("meta"))
 
         if mtype == "shutdown_request":
+            response_text = "shutdown approved"
             if request_id:
                 bus_cmd(
                     bus_path,
@@ -182,7 +183,7 @@ def handle_control_messages(
                         args.agent,
                         "--approve",
                         "--body",
-                        "shutdown approved",
+                        response_text,
                     ],
                 )
                 fs_control_respond(
@@ -191,31 +192,22 @@ def handle_control_messages(
                     request_id=request_id,
                     responder=args.agent,
                     approve=True,
-                    body="shutdown approved",
+                    body=response_text,
                     recipient=sender or lead,
                     req_type="shutdown",
                 )
-            dispatch_message(
-                fs_path=fs_path,
-                args=args,
-                msg_type="shutdown_response",
-                sender=args.agent,
-                recipient=sender or lead,
-                content="shutdown approved",
-                request_id=request_id,
-                approve=True,
-            )
-            # Compatibility alias used by some client protocols.
-            dispatch_message(
-                fs_path=fs_path,
-                args=args,
-                msg_type="shutdown_approved",
-                sender=args.agent,
-                recipient=sender or lead,
-                content="shutdown approved",
-                request_id=request_id,
-                approve=True,
-            )
+            else:
+                # Compatibility path for direct mailbox shutdown messages without request ids.
+                dispatch_message(
+                    fs_path=fs_path,
+                    args=args,
+                    msg_type="shutdown_response",
+                    sender=args.agent,
+                    recipient=sender or lead,
+                    content=response_text,
+                    request_id=request_id,
+                    approve=True,
+                )
             bus_cmd(
                 bus_path,
                 db_path,
@@ -287,18 +279,18 @@ def handle_control_messages(
                     recipient=sender or lead,
                     req_type="mode_set",
                 )
-
-            dispatch_message(
-                fs_path=fs_path,
-                args=args,
-                msg_type="mode_set_response",
-                sender=args.agent,
-                recipient=sender or lead,
-                content=response_text,
-                summary=summary,
-                request_id=request_id,
-                approve=approved,
-            )
+            else:
+                dispatch_message(
+                    fs_path=fs_path,
+                    args=args,
+                    msg_type="mode_set_response",
+                    sender=args.agent,
+                    recipient=sender or lead,
+                    content=response_text,
+                    summary=summary,
+                    request_id=request_id,
+                    approve=approved,
+                )
             bus_cmd(
                 bus_path,
                 db_path,
