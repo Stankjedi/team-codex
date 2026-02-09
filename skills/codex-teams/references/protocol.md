@@ -2,6 +2,11 @@
 
 ## Team Lifecycle
 
+Platform:
+- Windows host + WSL runtime only
+- Linux/macOS native runtime is out of scope
+- Target repository path must be on Windows mount (`/mnt/<drive>/...`)
+
 0. `setup`
 - prepares repo prerequisites for `run/up`:
   - initializes git repo when missing
@@ -20,27 +25,36 @@
 
 2. `run/up`
 - selects backend:
+  - default mode (when omitted): `in-process-shared`
   - `tmux` (`--tmux-layout split|window`)
-  - `--teammate-mode auto` is accepted and normalized to `tmux`
-- `tmux` is required for `run/up` in current single-mode policy
+  - `in-process` (one teammate loop per process)
+  - `in-process-shared` (one supervisor loop for all teammates)
+  - `auto` resolves by runtime context:
+    - non-interactive -> `in-process`
+    - interactive + inside tmux -> `tmux`
+    - interactive + outside tmux -> `in-process`
 - `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
+- `tmux` backend starts `team-mailbox` bridge window to inject unread mailbox messages into panes
+- `in-process` backends run mailbox poll loops and emit lifecycle status via bus/fs
+- `in-process` backends auto-reply to non-lead teammate senders for continuous worker/utility collaboration
 - emits startup `system` and worker-scaling `status` messages
 - `--workers auto` uses adaptive worker-pool scaling in range `2..4`
-- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(iterative) -> on-demand-research-by-lead -> lead-review -> utility-push/merge`
+- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(continuous) -> on-demand-research-by-lead -> lead-review -> utility-push/merge`
 - lead는 orchestration-only로 유지되며 구현 태스크를 직접 수행하지 않음
 - default auto-delegates initial task from `lead` to each worker/utility agent with role-specific execution prompt
 
 3. `teamdelete`
-- removes team directory (and kills active tmux session when `--force`)
+- removes team directory (and force-kills active runtime agents/tmux session when `--force`)
 
 ## Roles
 
-- `lead`: orchestration-only, staffing/delegation/intervention owner, worker 요청 시 추가 리서치/재계획을 수행하고 요청 worker에 재전달
+- `lead`: orchestration-only, staffing/delegation/intervention owner, worker 질문 수신 시 리서치 후 `answer/task`로 재전달
 - `worker-N`: implementation execution
 - `utility-1`: git/release/deploy utility owner
 - `monitor`: read-only tail of all traffic
 - `system`: lifecycle notices
 - `orchestrator`: auto-scaling/coordination notices
+- fixed topology contract: `lead + worker-N + utility-1`
 
 ## Message Kinds
 

@@ -5,7 +5,17 @@ description: Launch and operate Codex multi-agent sessions with real-time inter-
 
 # Codex Teams
 
-Codex CLI + tmux + SQLite bus + filesystem mailbox 기반 멀티 에이전트 스킬.
+Windows host + WSL 전용.
+Codex CLI + tmux/in-process + SQLite bus + filesystem mailbox 기반 멀티 에이전트 스킬.
+
+## Mandatory Collaboration Policy
+
+`$codex-teams` 스킬이 호출되면 작업은 **반드시 멀티에이전트 협업 방식**으로 수행해야 한다.
+
+- 기본 실행 형태: `lead + worker-N + utility-1` 협업 토폴로지
+- 기본 백엔드: `in-process-shared` (옵션 미지정 시)
+- 금지: 스킬 호출 후 단일 에이전트 단독 구현으로 대체하는 것
+- 예외: 런타임/환경 제약으로 멀티에이전트 실행이 불가능한 경우에만, blocker와 필요한 입력/조치 사항을 즉시 보고
 
 ## Quick Start
 
@@ -18,15 +28,22 @@ Codex CLI + tmux + SQLite bus + filesystem mailbox 기반 멀티 에이전트 �
 ```bash
 codex-teams setup --repo <repo>
 ```
+`<repo>`는 `/mnt/<drive>/...`(예: `/mnt/c/...`) 경로여야 합니다.
 
 3. Create team context (`TeamCreate` equivalent):
 ```bash
 codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo task force"
 ```
 
-4. Run swarm with Codex CLI panes (single-mode tmux):
+4. Run swarm:
 ```bash
 codex-teams run --task "<user task>" --session codex-fleet --workers auto --tmux-layout split --dashboard
+```
+기본 모드(옵션 생략 시)는 `in-process-shared`입니다.
+
+In-process backend example:
+```bash
+codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process-shared --no-attach
 ```
 
 Git binary override example (utility push/merge path):
@@ -52,18 +69,27 @@ codex-teams sendmessage --session codex-fleet --type message --from lead --to wo
 ## Runtime Layout
 
 `codex-teams run/up` runtime:
-- 백엔드는 `tmux` 단일 모드로 고정
-- `--teammate-mode`는 호환성 플래그이며 `auto|tmux`만 허용, `auto`는 `tmux`로 정규화
+- 백엔드: `tmux` | `in-process` | `in-process-shared`
+- 기본 `--teammate-mode`: `in-process-shared` (옵션 미지정 시)
+- `--teammate-mode`: `auto|tmux|in-process|in-process-shared`
+- `auto` 선택 규칙:
+  - non-interactive 실행: `in-process`
+  - interactive + tmux 내부: `tmux`
+  - interactive + tmux 외부: `in-process`
 - 작업 디렉터리 규칙: `lead`는 루트 레포, `worker/utility`는 `.worktrees/<agent>`
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
 - `--workers auto`: 태스크 난이도에 따라 `worker pool`을 2~4 범위에서 자동 선택
 - 워커 증설 원칙: 추가 워커가 필요하면 `--workers <N>`(또는 `auto`)로 재실행해 `.worktrees/worker-1..N`을 먼저 맞춘 뒤 작업을 분배
+- 워커/유틸 처리 결과는 리더뿐 아니라 질문 보낸 동료에게도 자동 회신되어 지속 협업 루프를 유지
+- 플랫폼 강제: Windows + WSL 환경에서만 실행 가능
+- 레포 경로 강제: `/mnt/<drive>/...` Windows 마운트 경로만 허용
 
 기본 역할 토폴로지:
 - `lead` x 1 (오케스트레이션 전용, 실행 작업 금지)
 - `worker` x N (가변)
 - `utility` x 1
+- 위 역할 형태는 고정 정책 (`lead + worker-N + utility-1`)
 
 ## Fixed Collaboration Workflow
 
@@ -71,8 +97,8 @@ codex-teams sendmessage --session codex-fleet --type message --from lead --to wo
 
 1. scope: lead가 범위/리스크 정리
 2. delegate: worker-N 분배
-3. peer-qa: lead/worker 간 질문/응답을 필요할 때마다 반복
-4. on-demand-research: worker가 중간 요청하면 lead가 추가 리서치/재계획 후 해당 worker에 재전달
+3. peer-qa: worker/utility/lead 간 질문/응답을 지속적으로 반복
+4. on-demand-research: worker가 모르는 항목을 lead에 질문하면 lead가 리서치 후 `answer`/`task`로 재전달
 5. review: lead가 결과 검수 후 승인/재작업 결정
 6. handoff: utility-1로 인계 후 push/merge
 
@@ -83,7 +109,13 @@ tmux mode layout:
 - window `swarm`: `lead` + `worker-N` + `utility-1` split panes
 - window `team-monitor`: full bus tail
 - window `team-pulse`: pane activity heartbeat emitter
+- window `team-mailbox`: unread mailbox를 각 pane으로 자동 주입
 - optional window `team-dashboard` with `--dashboard`
+
+in-process mode layout:
+- no tmux session required
+- each teammate (lead 포함) runs mailbox poll loop (`team_inprocess_agent.py`)
+- optional shared supervisor mode (`team_inprocess_hub.py`)
 
 This gives Claude Teams-style parallel visibility while keeping Codex CLI sessions native.
 
@@ -96,7 +128,7 @@ This gives Claude Teams-style parallel visibility while keeping Codex CLI sessio
   - `.codex-teams/<session>/state.json` + `runtime.json`
   - `.codex-teams/<session>/bus.sqlite`
   - room member registrations (`lead`, `worker-N`, `utility-1`, `system`, `monitor`, `orchestrator`)
-- `teamdelete` removes the team folder (or force-kills active tmux session first).
+- `teamdelete` removes the team folder (force mode kills active runtime agents and tmux session first).
 
 ## Message Contract
 
@@ -130,6 +162,9 @@ Model precedence (highest first):
 - `scripts/team_control.sh`: plan/shutdown/permission request-response helper
 - `scripts/team_dashboard.sh`: single-terminal live dashboard (all tmux panes)
 - `scripts/team_pulse.sh`: automatic heartbeat from pane content changes
+- `scripts/team_tmux_mailbox_bridge.py`: tmux pane mailbox auto-injector for continuous collaboration
+- `scripts/team_inprocess_agent.py`: per-agent mailbox poll + codex exec loop
+- `scripts/team_inprocess_hub.py`: shared in-process supervisor for multiple agents
 - `scripts/install_global.sh`: global install + launchers
 
 ## IDE / Terminal Usage
