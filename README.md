@@ -99,6 +99,32 @@ export CODEX_EXPERIMENTAL_AGENT_TEAMS=1
 export CODEX_TEAMS_GATE_TENGU_AMBER_FLINT=1
 ```
 
+## Utility Git 세팅 (GitHub 공유용)
+
+유틸리티가 push/merge를 수행할 때 사용할 git 바이너리는 `GIT_BIN` 또는 `CODEX_TEAM_GIT_BIN`으로 지정할 수 있습니다.
+
+1. 설정 파일 생성
+```bash
+cp .codex-multi-agent.config.example.sh .codex-multi-agent.config.sh
+```
+
+2. 환경별 설정
+- Linux/macOS: `GIT_BIN="git"`
+- WSL + Windows Git:
+```bash
+GIT_BIN="/mnt/c/Program Files/Git/cmd/git.exe"
+CODEX_TEAM_GIT_BIN="$GIT_BIN"
+export PATH="/mnt/c/Program Files/Git/cmd:$PATH"
+```
+
+3. WSL에서 HTTPS 인증까지 쓰는 경우(권장)
+```bash
+git config --global credential.helper '!"/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe"'
+```
+
+4. 확인
+- `codex-teams run ...` 시작 로그에 `git bin: ...`이 출력되면 적용된 상태입니다.
+
 ## 모델 배분 (GPT-5.3 Codex)
 
 역할별 모델 배분은 `.codex/config.toml`에서 관리합니다.

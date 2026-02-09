@@ -24,6 +24,11 @@ codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo tas
 codex-teams run --task "<user task>" --session codex-fleet --workers auto --teammate-mode tmux --tmux-layout split --dashboard
 ```
 
+Git binary override example (utility push/merge path):
+```bash
+codex-teams run --task "<user task>" --session codex-fleet --git-bin "/mnt/c/Program Files/Git/cmd/git.exe"
+```
+
 4. Or run in-process teammates:
 ```bash
 codex-teams run --task "<user task>" --session codex-fleet --teammate-mode in-process --no-attach

@@ -71,6 +71,9 @@ AUTO_WORKERS_REASON=""
 
 LEAD_MODEL=""
 LEAD_PROFILE=""
+GIT_BIN_OVERRIDE=""
+GIT_BIN=""
+BOOT_GIT_BIN="${CODEX_TEAM_GIT_BIN:-${CLAUDE_CODE_TEAM_GIT_BIN:-git}}"
 UTILITY_PROFILE=""
 UTILITY_MODEL=""
 WORKER_COUNT="2"
@@ -110,6 +113,7 @@ Common options:
   --model MODEL           Set model for all roles
   --director-model MODEL  Lead model override (legacy flag name)
   --worker-model MODEL    Worker model override
+  --git-bin PATH          Git binary override (e.g. /mnt/c/Program Files/Git/cmd/git.exe)
 
 Backend options:
   --teammate-mode MODE    auto|tmux|in-process|in-process-shared (default: auto)
@@ -194,6 +198,39 @@ require_teams_enabled() {
 is_abs_path() {
   local p="${1:-}"
   [[ "$p" == /* ]] || [[ "$p" =~ ^[A-Za-z]:[/\\] ]]
+}
+
+is_windows_binary() {
+  local bin="${1:-}"
+  [[ "${bin,,}" == *.exe ]]
+}
+
+repo_path_for_git_bin() {
+  local bin="$1"
+  local repo_path="$2"
+  if is_windows_binary "$bin" && command -v wslpath >/dev/null 2>&1; then
+    wslpath -w "$repo_path"
+  else
+    printf '%s\n' "$repo_path"
+  fi
+}
+
+repo_path_from_git_bin() {
+  local bin="$1"
+  local repo_path="$2"
+  if is_windows_binary "$bin" && command -v wslpath >/dev/null 2>&1; then
+    wslpath -u "$repo_path"
+  else
+    printf '%s\n' "$repo_path"
+  fi
+}
+
+git_repo_cmd() {
+  local repo_path="$1"
+  shift
+  local repo_for_git
+  repo_for_git="$(repo_path_for_git_bin "$GIT_BIN" "$repo_path")"
+  "$GIT_BIN" -C "$repo_for_git" "$@"
 }
 
 abs_path_from() {
@@ -434,6 +471,7 @@ load_config_or_defaults() {
   PERMISSION_MODE="default"
   PLAN_MODE_REQUIRED="false"
   AUTO_DELEGATE="true"
+  GIT_BIN="git"
 
   if [[ -f "$CONFIG" ]]; then
     # shellcheck source=/dev/null
@@ -452,6 +490,11 @@ load_config_or_defaults() {
     CODEX_BIN="$CODEX_TEAMMATE_COMMAND"
   elif [[ -n "${CLAUDE_CODE_TEAMMATE_COMMAND:-}" ]]; then
     CODEX_BIN="$CLAUDE_CODE_TEAMMATE_COMMAND"
+  fi
+  if [[ -n "${CODEX_TEAM_GIT_BIN:-}" ]]; then
+    GIT_BIN="$CODEX_TEAM_GIT_BIN"
+  elif [[ -n "${CLAUDE_CODE_TEAM_GIT_BIN:-}" ]]; then
+    GIT_BIN="$CLAUDE_CODE_TEAM_GIT_BIN"
   fi
 
   if [[ -n "$DIRECTOR_PROFILE_OVERRIDE" ]]; then
@@ -477,6 +520,9 @@ load_config_or_defaults() {
   fi
   if [[ -n "$AUTO_DELEGATE_OVERRIDE" ]]; then
     AUTO_DELEGATE="$AUTO_DELEGATE_OVERRIDE"
+  fi
+  if [[ -n "$GIT_BIN_OVERRIDE" ]]; then
+    GIT_BIN="$GIT_BIN_OVERRIDE"
   fi
 
   if [[ -z "$LEAD_PROFILE" ]]; then
@@ -709,7 +755,7 @@ ensure_worktrees() {
   mkdir -p "$WORKTREES_ROOT"
 
   local dirty="false"
-  if [[ -n "$(git -C "$REPO" status --porcelain=v1 --untracked-files=no)" ]]; then
+  if [[ -n "$(git_repo_cmd "$REPO" status --porcelain=v1 --untracked-files=no)" ]]; then
     dirty="true"
   fi
 
@@ -720,15 +766,15 @@ ensure_worktrees() {
   local base_commit
   if [[ "$USE_BASE_WIP" == "true" && "$dirty" == "true" ]]; then
     local wip_hash
-    wip_hash="$(git -C "$REPO" stash create "codex-teams-wip")"
+    wip_hash="$(git_repo_cmd "$REPO" stash create "codex-teams-wip")"
     if [[ -z "$wip_hash" ]]; then
       abort "failed to create WIP snapshot for worktrees"
     fi
     local wip_ref="refs/codex/wip/team-$(date +%Y%m%d-%H%M%S)"
-    git -C "$REPO" update-ref "$wip_ref" "$wip_hash"
+    git_repo_cmd "$REPO" update-ref "$wip_ref" "$wip_hash"
     base_commit="$wip_hash"
   else
-    base_commit="$(git -C "$REPO" rev-parse --verify "${BASE_REF}^{commit}")"
+    base_commit="$(git_repo_cmd "$REPO" rev-parse --verify "${BASE_REF}^{commit}")"
   fi
 
   local name
@@ -736,19 +782,19 @@ ensure_worktrees() {
     local branch="ma/$name"
     local wt_path="$WORKTREES_ROOT/$name"
 
-    if git -C "$REPO" worktree list --porcelain | grep -Fxq "worktree $wt_path"; then
+    if git_repo_cmd "$REPO" worktree list --porcelain | grep -Fxq "worktree $wt_path"; then
       continue
     fi
 
-    if git -C "$REPO" worktree list --porcelain | grep -Fxq "branch refs/heads/$branch"; then
+    if git_repo_cmd "$REPO" worktree list --porcelain | grep -Fxq "branch refs/heads/$branch"; then
       echo "skip: $branch already checked out elsewhere" >&2
       continue
     fi
 
-    if git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
-      git -C "$REPO" worktree add "$wt_path" "$branch" >/dev/null
+    if git_repo_cmd "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+      git_repo_cmd "$REPO" worktree add "$wt_path" "$branch" >/dev/null
     else
-      git -C "$REPO" worktree add -b "$branch" "$wt_path" "$base_commit" >/dev/null
+      git_repo_cmd "$REPO" worktree add -b "$branch" "$wt_path" "$base_commit" >/dev/null
     fi
   done
 }
@@ -770,10 +816,12 @@ WORKER_PROFILE_VALUE="$WORKER_PROFILE"
 TEAM_LEAD_NAME_VALUE="$TEAM_LEAD_NAME"
 DEFAULT_MODEL_VALUE="$MODEL"
 CODEX_BIN_VALUE="$CODEX_BIN"
+GIT_BIN_VALUE="$GIT_BIN"
 PERMISSION_MODE_VALUE="$PERMISSION_MODE"
 
 export CODEX_EXPERIMENTAL_AGENT_TEAMS=1
 export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+export CODEX_TEAM_GIT_BIN="\$GIT_BIN_VALUE"
 
 agent_name="\${CODEX_TEAM_AGENT:-}"
 agent_role="\${CODEX_TEAM_ROLE:-worker}"
@@ -1123,6 +1171,7 @@ EOF
   elif [[ "$role" == "utility" ]]; then
     role_specific_contract="$(cat <<EOF
 7. If release/merge context is unclear, ask lead and wait for explicit handoff approval.
+8. Use the configured git binary for push/merge operations when available: \`"$GIT_BIN"\`.
 EOF
 )"
   fi
@@ -1245,6 +1294,7 @@ print_start_summary() {
   echo "- auto delegate: $AUTO_DELEGATE"
   echo "- room: $ROOM"
   echo "- bus db: $DB"
+  echo "- git bin: $GIT_BIN"
   echo "- team config: $TEAM_CONFIG"
   echo "- state: $TEAM_ROOT/state.json"
   echo "- viewer bridge: $REPO/$VIEWER_BRIDGE_FILE"
@@ -1262,7 +1312,7 @@ print_start_summary() {
 }
 
 run_swarm() {
-  require_cmd git
+  require_cmd "$GIT_BIN"
   require_cmd python3
   require_cmd "$CODEX_BIN"
 
@@ -1758,6 +1808,10 @@ parse_args() {
         WORKER_MODEL="$2"
         shift 2
         ;;
+      --git-bin)
+        GIT_BIN_OVERRIDE="$2"
+        shift 2
+        ;;
       --director-profile)
         DIRECTOR_PROFILE_OVERRIDE="$2"
         shift 2
@@ -1908,10 +1962,14 @@ parse_args() {
   done
 
   REPO="$(cd "$REPO" && pwd)"
-  if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  local repo_for_boot_git
+  repo_for_boot_git="$(repo_path_for_git_bin "$BOOT_GIT_BIN" "$REPO")"
+  if ! "$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     abort "not a git repository: $REPO"
   fi
-  REPO="$(git -C "$REPO" rev-parse --show-toplevel)"
+  local repo_resolved
+  repo_resolved="$("$BOOT_GIT_BIN" -C "$repo_for_boot_git" rev-parse --show-toplevel)"
+  REPO="$(repo_path_from_git_bin "$BOOT_GIT_BIN" "$repo_resolved")"
 
   if [[ -z "$CONFIG" ]]; then
     CONFIG="$REPO/.codex-multi-agent.config.sh"

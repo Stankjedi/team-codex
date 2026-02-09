@@ -9,6 +9,7 @@
 - 릴리스/배포 단계 체크리스트
 - 산출물 경로/버전/태깅 일관성 확인
 - Lead 승인 완료분 기준 push/merge 실행 및 결과 공유
+- `CODEX_TEAM_GIT_BIN` 또는 `GIT_BIN`이 지정된 경우 해당 git 바이너리 우선 사용
 
 ## 협업 대상
 - `lead`, `worker-*`
