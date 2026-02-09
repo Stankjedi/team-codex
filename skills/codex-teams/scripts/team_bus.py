@@ -77,77 +77,92 @@ def connect(db_path: str) -> sqlite3.Connection:
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except sqlite3.OperationalError:
+        # Some mounted filesystems (for example drvfs/9p) can fail on WAL mode.
+        # Fall back to a broadly compatible mode instead of aborting session init.
+        conn.execute("PRAGMA journal_mode=DELETE;")
     return conn
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            room TEXT NOT NULL,
-            sender TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            body TEXT NOT NULL,
-            meta_json TEXT NOT NULL DEFAULT '{}'
-        );
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS members (
-            room TEXT NOT NULL,
-            agent TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'member',
-            status TEXT NOT NULL DEFAULT 'active',
-            joined_ts TEXT NOT NULL,
-            last_seen_ts TEXT NOT NULL,
-            PRIMARY KEY (room, agent)
-        );
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS mailbox (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER NOT NULL,
-            room TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'unread',
-            created_ts TEXT NOT NULL,
-            read_ts TEXT,
-            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
-        );
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS control_requests (
-            request_id TEXT PRIMARY KEY,
-            room TEXT NOT NULL,
-            req_type TEXT NOT NULL,
-            sender TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            body TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_ts TEXT NOT NULL,
-            updated_ts TEXT NOT NULL,
-            response_body TEXT NOT NULL DEFAULT ''
-        );
-        """
-    )
+    attempts = 5
+    delay_sec = 0.12
+    for i in range(attempts):
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    room TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    meta_json TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS members (
+                    room TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'member',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    joined_ts TEXT NOT NULL,
+                    last_seen_ts TEXT NOT NULL,
+                    PRIMARY KEY (room, agent)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mailbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    room TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'unread',
+                    created_ts TEXT NOT NULL,
+                    read_ts TEXT,
+                    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS control_requests (
+                    request_id TEXT PRIMARY KEY,
+                    room TEXT NOT NULL,
+                    req_type TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_ts TEXT NOT NULL,
+                    updated_ts TEXT NOT NULL,
+                    response_body TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
 
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room, id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_members_room_role ON members(room, role, status);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_room_recipient_state ON mailbox(room, recipient, state, id);")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_control_requests_room_recipient_status ON control_requests(room, recipient, status, created_ts);"
-    )
-    conn.commit()
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room, id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_members_room_role ON members(room, role, status);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_room_recipient_state ON mailbox(room, recipient, state, id);")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_control_requests_room_recipient_status ON control_requests(room, recipient, status, created_ts);"
+            )
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            # drvfs/9p environments can throw transient disk I/O errors during schema writes.
+            if "disk i/o error" not in str(exc).lower() or i == attempts - 1:
+                raise
+            time.sleep(delay_sec * (i + 1))
 
 
 def parse_meta(raw: str | None) -> str:

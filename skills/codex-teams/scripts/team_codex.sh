@@ -91,7 +91,7 @@ Common options:
   --config PATH           Config path (default: <repo>/.codex-multi-agent.config.sh)
   --room NAME             Team bus room (default: main)
   --session NAME          Session/team name override
-  --workers N             Worker count override
+  --workers N|auto        Worker count override (`auto`: adaptive 2..4)
   --director-profile NAME Director profile override
   --worker-profile NAME   Worker profile override
   --model MODEL           Set both director/worker model
@@ -315,6 +315,20 @@ orchestrator_pick_worker_count() {
   printf '%s|%s\n' "$picked" "$reason"
 }
 
+worker_peer_name() {
+  local idx="$1"
+  local total="$2"
+  if [[ "$total" -le 1 ]]; then
+    printf '%s\n' "$TEAM_LEAD_NAME"
+    return
+  fi
+  if [[ "$idx" -ge "$total" ]]; then
+    printf '%s\n' "$PREFIX-$((idx - 1))"
+    return
+  fi
+  printf '%s\n' "$PREFIX-$((idx + 1))"
+}
+
 fs_cmd() {
   python3 "$FS" "$@"
 }
@@ -385,15 +399,30 @@ load_config_or_defaults() {
   fi
 
   if [[ -n "$WORKERS" ]]; then
-    if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || [[ "$WORKERS" -lt 1 ]]; then
-      abort "--workers must be an integer >= 1"
+    if [[ "$WORKERS" == "auto" ]]; then
+      local orchestrator_decision
+      if [[ -n "$TASK" ]]; then
+        orchestrator_decision="$(orchestrator_pick_worker_count "$TASK")"
+      else
+        orchestrator_decision="2|manual-auto-no-task"
+      fi
+      COUNT="${orchestrator_decision%%|*}"
+      AUTO_WORKERS_REASON="${orchestrator_decision#*|}"
+      AUTO_WORKERS_APPLIED="true"
+    elif [[ "$WORKERS" =~ ^[0-9]+$ ]] && [[ "$WORKERS" -ge 1 ]]; then
+      COUNT="$WORKERS"
+    else
+      abort "--workers must be an integer >= 1 or 'auto'"
     fi
-    COUNT="$WORKERS"
   elif [[ "$COMMAND" == "run" && -n "$TASK" ]]; then
     local orchestrator_decision
     orchestrator_decision="$(orchestrator_pick_worker_count "$TASK")"
     COUNT="${orchestrator_decision%%|*}"
     AUTO_WORKERS_REASON="${orchestrator_decision#*|}"
+    AUTO_WORKERS_APPLIED="true"
+  elif [[ "$COMMAND" == "up" ]]; then
+    COUNT="2"
+    AUTO_WORKERS_REASON="up-baseline-no-task"
     AUTO_WORKERS_APPLIED="true"
   fi
 
@@ -434,12 +463,14 @@ load_config_or_defaults() {
 
   RESOLVED_BACKEND="$TEAMMATE_MODE"
   if [[ "$RESOLVED_BACKEND" == "auto" ]]; then
-    if [[ ! -t 0 || ! -t 1 ]]; then
-      RESOLVED_BACKEND="in-process"
-    elif [[ -n "${TMUX:-}" ]]; then
+    if [[ -n "${TMUX:-}" ]]; then
       RESOLVED_BACKEND="tmux"
+    elif [[ -t 0 && -t 1 ]] && command -v tmux >/dev/null 2>&1; then
+      RESOLVED_BACKEND="tmux"
+    elif [[ ! -t 0 || ! -t 1 ]]; then
+      RESOLVED_BACKEND="in-process-shared"
     else
-      RESOLVED_BACKEND="in-process"
+      RESOLVED_BACKEND="in-process-shared"
     fi
   fi
 }
@@ -949,11 +980,14 @@ build_worker_task_prompt() {
   local idx="$2"
   local total="$3"
   local user_task="$4"
+  local peer
+  peer="$(worker_peer_name "$idx" "$total")"
   local focus
   focus="$(worker_focus_instruction "$idx" "$total")"
   cat <<EOF
 [Codex Teams]
 team=$TMUX_SESSION lead=$TEAM_LEAD_NAME worker=$agent role_index=$idx/$total
+peer_collaboration_target=$peer
 
 Primary objective:
 $focus
@@ -965,8 +999,16 @@ Execution contract:
 1. Start immediately and keep changes scoped to your assigned slice.
 2. Send progress/completion/blocker updates through:
    codex-teams sendmessage --session "$TMUX_SESSION" --room "$ROOM" --type message --from "$agent" --to "$TEAM_LEAD_NAME" --summary "<progress|done|blocker>" --content "<update>"
-3. If teammate coordination is required, send direct message or broadcast via codex-teams sendmessage.
+3. Realtime collaboration is mandatory: whenever requirements, API contracts, or integration points are unclear, ask $peer immediately and continue question/answer exchanges until resolved.
+4. Include evidence in your done update: changed files + validation command result + remaining risk.
 EOF
+}
+
+announce_collaboration_workflow() {
+  local workflow_summary
+  workflow_summary="workflow-fixed scope->delegate->peer-qa->verify->handoff; policy=adaptive-workers-2..4"
+  python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status --body "$workflow_summary" >/dev/null
+  fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from orchestrator --recipient all --summary "workflow-fixed" --content "$workflow_summary" >/dev/null || true
 }
 
 tmux_send_worker_task() {
@@ -1088,6 +1130,7 @@ run_swarm() {
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status \
       --body "auto-worker-scaling selected pairs=$COUNT reason=$AUTO_WORKERS_REASON" >/dev/null
   fi
+  announce_collaboration_workflow
 
   inject_initial_task
   print_start_summary

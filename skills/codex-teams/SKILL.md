@@ -21,7 +21,7 @@ codex-teams teamcreate --session codex-fleet --workers 4 --description "Repo tas
 
 3. Run swarm with Codex CLI panes:
 ```bash
-codex-teams run --task "<user task>" --session codex-fleet --teammate-mode tmux --tmux-layout split --dashboard
+codex-teams run --task "<user task>" --session codex-fleet --workers auto --teammate-mode tmux --tmux-layout split --dashboard
 ```
 
 4. Or run in-process teammates:
@@ -52,12 +52,25 @@ codex-teams sendmessage --session codex-fleet --type message --from director --t
 ## Runtime Layout
 
 `codex-teams run/up` modes:
-- `--teammate-mode auto`: TTY/tmux 환경 기준 자동 선택
+- `--teammate-mode auto`: 대화형+tmux 가능 시 `tmux`, 그 외 `in-process-shared` 자동 선택
 - `--teammate-mode tmux`: tmux 세션에 director/worker 패널 생성
 - `--teammate-mode in-process`: 파일 mailbox 폴링 루프 기반 워커 실행
 - `--teammate-mode in-process-shared`: 단일 허브 프로세스에서 다수 워커 루프를 공유 실행
 - 기본 `--auto-delegate`: 초기 사용자 요청을 워커별 하위 태스크로 자동 분배
 - `--no-auto-delegate`: 리더만 초기 지시를 받고 수동 분배
+- `--workers auto`: 태스크 난이도에 따라 pair 에이전트를 2~4 범위에서 자동 선택
+
+## Fixed Collaboration Workflow
+
+`run/up` 실행 시 아래 협업 흐름을 기본 계약으로 사용:
+
+1. scope: director가 범위/리스크 정리
+2. delegate: pair-N 분배
+3. peer-qa: pair 간 질문/응답을 필요할 때마다 반복
+4. verify: 테스트/검증 증거 공유
+5. handoff: done + 잔여 리스크 전달
+
+세션 시작 시 버스에 `workflow-fixed ...` 상태 이벤트를 남겨 추적 가능.
 
 tmux mode layout:
 - tmux session `<session>`
@@ -115,13 +128,19 @@ Model precedence (highest first):
 - `scripts/team_inprocess_hub.py`: shared in-process multi-worker hub loop
 - `scripts/install_global.sh`: global install + launchers
 
-## IDE Viewer Extension
+## IDE / Terminal Usage
 
-Use `extensions/antigravity-codex-teams-viewer` to watch tmux pane outputs and bus messages in OpenVSX-based IDEs.
+Dashboard extension is removed. Use terminal-first monitoring instead.
 
-Bridge integration:
-- `teamcreate` / `run` / `up` writes `.codex-teams/.viewer-session.json`
-- Viewer extension can auto-follow this bridge (`useSkillBridge=true`) so skill usage in IDE chat is reflected without opening a separate terminal panel.
+- Attach tmux session directly:
+```bash
+tmux attach -t <session>
+```
+
+- Or open unified dashboard:
+```bash
+codex-teams-dashboard --session <session> --repo <repo> --room main
+```
 
 ## Legacy Backend
 

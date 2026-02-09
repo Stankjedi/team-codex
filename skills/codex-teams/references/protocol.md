@@ -10,7 +10,6 @@
   - `.codex-teams/<session>/state.json`
   - `.codex-teams/<session>/runtime.json`
 - initializes `.codex-teams/<session>/bus.sqlite`
-- updates viewer bridge `.codex-teams/.viewer-session.json` (active session metadata for IDE extension)
 - registers team members in bus (`director`, `pair-N`, `system`, `monitor`, `orchestrator`)
 
 2. `run/up`
@@ -19,8 +18,13 @@
   - `tmux` (`--tmux-layout split|window`)
   - `in-process` (filesystem mailbox poll loop)
   - `in-process-shared` (single-process hub running multiple teammate loops)
+- `auto` backend policy:
+  - interactive + tmux available => `tmux`
+  - otherwise => `in-process-shared`
 - `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
 - emits startup `system` and worker-scaling `status` messages
+- `--workers auto` uses adaptive pair scaling in range `2..4`
+- emits fixed workflow `status`: `scope -> delegate -> peer-qa(iterative) -> verify -> handoff`
 - default auto-delegates initial task from `director` to each `pair-N` with role-specific execution prompt
 
 3. `teamdelete`
