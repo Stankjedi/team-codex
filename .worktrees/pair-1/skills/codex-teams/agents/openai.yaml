@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Teams"
+  short_description: "Codex CLI swarm panes + real-time team bus for director-worker sessions"
+  default_prompt: "Use $codex-teams to run this repository task with TeamCreate -> run flow. Launch director + parallel workers in tmux swarm panes, coordinate via sendmessage/mailbox/control, and report progress with concrete file/test evidence."
