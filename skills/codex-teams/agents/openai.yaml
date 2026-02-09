@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Teams"
-  short_description: "Codex CLI swarm panes + real-time team bus for lead + worker-N + utility sessions"
-  default_prompt: "Use $codex-teams with the topology (lead, worker-N, utility-1). Keep lead orchestration-only, delegate dynamically to worker pool, enforce iterative question/answer collaboration, then handoff to utility for git push/merge with evidence."
+  short_description: "Codex CLI swarm panes + real-time team bus for lead(external) + worker-1/2/3 sessions"
+  default_prompt: "Use $codex-teams with the topology (lead external session, worker-1, worker-2, worker-3). Keep lead orchestration-only, delegate to the fixed worker trio, enforce iterative question/answer collaboration, then assign one worker for git push/merge with evidence."

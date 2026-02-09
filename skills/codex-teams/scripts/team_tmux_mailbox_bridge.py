@@ -288,7 +288,7 @@ def main() -> int:
     parser.add_argument("--tmux-session", default="")
     parser.add_argument("--lead-name", default="lead")
     parser.add_argument("--auto-kill-done-workers", default="true")
-    parser.add_argument("--poll-ms", type=int, default=800)
+    parser.add_argument("--poll-ms", type=int, default=1500)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
 

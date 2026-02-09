@@ -227,7 +227,7 @@ def main() -> int:
     parser.add_argument("--lead-profile", default="")
     parser.add_argument("--lead-model", default="")
     parser.add_argument("--codex-bin", default="codex")
-    parser.add_argument("--poll-ms", type=int, default=500)
+    parser.add_argument("--poll-ms", type=int, default=1000)
     parser.add_argument("--idle-ms", type=int, default=12000)
     parser.add_argument("--permission-mode", default="default")
     parser.add_argument("--plan-mode-required", action="store_true")

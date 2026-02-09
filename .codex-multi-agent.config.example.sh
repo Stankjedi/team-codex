@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Project config for codex multi-agent orchestration.
-# Topology is fixed by codex-teams runtime: lead x1 + worker xN + utility x1.
+# Topology is fixed by codex-teams runtime: lead(external) x1 + worker x3.
 
-# Number of workers (worker-1 ... worker-N)
-COUNT=2
+# Number of workers (fixed policy: 3)
+COUNT=3
 PREFIX="worker"
 
 # Where worker worktrees are created (relative to repo root or absolute path).
 WORKTREES_DIR=".worktrees"
-# 리더 전용 worktree 이름(.worktrees/<name>).
-LEAD_WORKTREE_NAME="lead-1"
 
 # Base commit/ref for new worker branches.
 BASE_REF="HEAD"
@@ -29,20 +27,25 @@ CODEX_BIN="codex"
 DIRECTOR_PROFILE="director"
 WORKER_PROFILE="pair"
 
-# If run command is used, wait this many seconds before sending director task.
-DIRECTOR_INPUT_DELAY="2"
-
 # Merge mode when integrating workers: merge or cherry-pick
 MERGE_STRATEGY="merge"
 
-# Backend default (tmux keeps teammates running even after launcher shell exits).
-TEAMMATE_MODE="tmux"
+# Backend default (resource-lean shared supervisor).
+TEAMMATE_MODE="in-process-shared"
 TMUX_LAYOUT="split"
 PERMISSION_MODE="default"
 PLAN_MODE_REQUIRED="false"
 AUTO_DELEGATE="true"
 # true: lead inbox에서 done status를 받은 worker tmux pane/window를 자동 종료.
 AUTO_KILL_DONE_WORKER_TMUX="true"
+# true: tmux pane heartbeat emitter(team-pulse) 실행.
+ENABLE_TMUX_PULSE="false"
+# tmux mailbox bridge polling interval(ms). 값을 키우면 CPU 사용량 감소.
+TMUX_MAILBOX_POLL_MS="1500"
+# in-process mailbox poll interval(ms). 값을 키우면 CPU 사용량 감소.
+INPROCESS_POLL_MS="1000"
+# in-process idle status cadence(ms).
+INPROCESS_IDLE_MS="12000"
 
 # Git selection (WSL)
 # Default recommendation: keep WSL git to avoid Windows conhost.exe overhead.

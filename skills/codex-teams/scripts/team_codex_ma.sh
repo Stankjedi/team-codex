@@ -30,8 +30,6 @@ WORKER_MODEL=""
 DIRECTOR_PROFILE_OVERRIDE=""
 WORKER_PROFILE_OVERRIDE=""
 SESSION_OVERRIDE=""
-AUTO_WORKERS_APPLIED="false"
-AUTO_WORKERS_REASON=""
 
 usage() {
   cat <<'EOF'
@@ -47,7 +45,7 @@ Common options:
 
 run/up options:
   --task TEXT               Initial task (required for run)
-  --workers N               Override worker count (disables auto orchestration)
+  --workers N               Worker count override (fixed policy: only `3` is accepted)
   --model MODEL             Override model for all roles
   --director-model MODEL    Override director model only
   --worker-model MODEL      Override worker model only
@@ -213,74 +211,8 @@ if [[ "$COMMAND" != "init" ]]; then
   fi
 fi
 
-# Orchestrator heuristic that auto-scales pair workers from 2..4 based on task scope.
-orchestrator_pick_worker_count() {
-  local raw_task="$1"
-  local task
-  task="$(printf '%s' "$raw_task" | tr '[:upper:]' '[:lower:]')"
-  local words
-  words="$(printf '%s\n' "$task" | wc -w | tr -d ' ')"
-  local score=0
-  local domain_count=0
-  local separators=0
-  local reasons=()
-
-  if [[ "$words" -ge 35 ]]; then
-    score=$((score + 1))
-    reasons+=("long-brief")
-  fi
-  if [[ "$words" -ge 80 ]]; then
-    score=$((score + 1))
-    reasons+=("very-long-brief")
-  fi
-
-  [[ "$task" == *","* ]] && separators=$((separators + 1))
-  [[ "$task" == *";"* ]] && separators=$((separators + 1))
-  [[ "$task" == *$'\n'* ]] && separators=$((separators + 1))
-  [[ "$task" =~ [0-9]+\.[[:space:]] ]] && separators=$((separators + 1))
-  [[ "$task" == *" and "* ]] && separators=$((separators + 1))
-  if [[ "$separators" -ge 2 ]]; then
-    score=$((score + 1))
-    reasons+=("multi-subtasks")
-  fi
-
-  [[ "$task" =~ (ui|ux|frontend|react|vue|css|design|layout) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (backend|server|api|endpoint|controller|service) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (db|database|sql|schema|migration|postgres|mysql|sqlite|redis) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (test|testing|ci|e2e|integration|unit) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (deploy|docker|k8s|infra|terraform|pipeline|release) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (docs|readme|documentation) ]] && domain_count=$((domain_count + 1))
-  if [[ "$domain_count" -ge 3 ]]; then
-    score=$((score + 1))
-    reasons+=("cross-domain")
-  fi
-  if [[ "$domain_count" -ge 5 ]]; then
-    score=$((score + 1))
-    reasons+=("wide-scope")
-  fi
-
-  if [[ "$task" =~ (refactor|migration|re-architect|rearchitect|rewrite|major|end-to-end|across) ]]; then
-    score=$((score + 1))
-    reasons+=("complex-change")
-  fi
-
-  local picked="2"
-  if [[ "$score" -ge 4 ]]; then
-    picked="4"
-  elif [[ "$score" -ge 2 ]]; then
-    picked="3"
-  fi
-
-  local reason="baseline"
-  if [[ "${#reasons[@]}" -gt 0 ]]; then
-    reason="$(IFS=,; echo "${reasons[*]}")"
-  fi
-
-  printf '%s|%s\n' "$picked" "$reason"
-}
-
 # Defaults for worker orchestration, then load project config.
-COUNT="4"
+COUNT="3"
 PREFIX="pair"
 TMUX_SESSION="codex-fleet"
 DIRECTOR_PROFILE="director"
@@ -304,16 +236,11 @@ if [[ -n "$SESSION_OVERRIDE" ]]; then
   TMUX_SESSION="$SESSION_OVERRIDE"
 fi
 if [[ -n "$WORKERS" ]]; then
-  if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || [[ "$WORKERS" -lt 1 ]]; then
-    echo "--workers must be an integer >= 1" >&2
+  if [[ "$WORKERS" != "3" ]]; then
+    echo "--workers is fixed at 3 in codex-teams bridge mode" >&2
     exit 2
   fi
-  COUNT="$WORKERS"
-elif [[ "$COMMAND" == "run" && -n "$TASK" ]]; then
-  orchestrator_decision="$(orchestrator_pick_worker_count "$TASK")"
-  COUNT="${orchestrator_decision%%|*}"
-  AUTO_WORKERS_REASON="${orchestrator_decision#*|}"
-  AUTO_WORKERS_APPLIED="true"
+  COUNT="3"
 fi
 
 if [[ -n "$MODEL" ]]; then
@@ -345,9 +272,9 @@ register_team_members() {
 }
 
 CONFIG_TO_USE="$CONFIG"
-if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [[ "$COUNT" -lt 1 ]]; then
-  echo "worker count must be an integer >= 1 (resolved: $COUNT)" >&2
-  exit 2
+if [[ "$COUNT" != "3" ]]; then
+  echo "info: fixed worker policy active (forcing COUNT=3; resolved: $COUNT)" >&2
+  COUNT="3"
 fi
 
 register_team_members
@@ -599,10 +526,6 @@ case "$COMMAND" in
 
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
       --body "session=$TMUX_SESSION started via codex-teams workers=$COUNT"
-    if [[ "$AUTO_WORKERS_APPLIED" == "true" ]]; then
-      python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status \
-        --body "auto-worker-scaling selected pairs=$COUNT reason=$AUTO_WORKERS_REASON"
-    fi
 
     if [[ -n "$TASK" ]]; then
       python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to director --kind task --body "$TASK"
@@ -615,11 +538,7 @@ case "$COMMAND" in
     echo "- tmux session: $TMUX_SESSION"
     echo "- room: $ROOM"
     echo "- bus db: $DB"
-    if [[ "$AUTO_WORKERS_APPLIED" == "true" ]]; then
-      echo "- workers: $COUNT (orchestrator auto-scaling: $AUTO_WORKERS_REASON)"
-    else
-      echo "- workers: $COUNT"
-    fi
+    echo "- workers: $COUNT (fixed)"
     if [[ -n "$DIRECTOR_MODEL" || -n "$WORKER_MODEL" ]]; then
       echo "- models: director=${DIRECTOR_MODEL:-<config default>} worker=${WORKER_MODEL:-<config default>}"
     fi

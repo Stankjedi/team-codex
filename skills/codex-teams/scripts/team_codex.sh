@@ -59,6 +59,10 @@ PLAN_MODE_REQUIRED_OVERRIDE=""
 AUTO_DELEGATE="true"
 AUTO_DELEGATE_OVERRIDE=""
 AUTO_KILL_DONE_WORKER_TMUX="true"
+ENABLE_TMUX_PULSE="false"
+TMUX_MAILBOX_POLL_MS="1500"
+INPROCESS_POLL_MS="1000"
+INPROCESS_IDLE_MS="12000"
 
 MESSAGE_TYPE="message"
 MESSAGE_SENDER=""
@@ -70,21 +74,14 @@ MESSAGE_META="{}"
 MESSAGE_REQUEST_ID=""
 MESSAGE_APPROVE=""
 
-AUTO_WORKERS_APPLIED="false"
-AUTO_WORKERS_REASON=""
-
 LEAD_MODEL=""
 LEAD_PROFILE=""
 GIT_BIN_OVERRIDE=""
 GIT_BIN=""
 BOOT_GIT_BIN="git"
-UTILITY_PROFILE=""
-UTILITY_MODEL=""
-WORKER_COUNT="2"
-UTILITY_COUNT="1"
+WORKER_COUNT="3"
 TEAM_ROLE_SUMMARY=""
 NORMALIZED_TEAMMATE_MODE=""
-LEAD_WORKTREE_NAME="lead-1"
 LEAD_WORKTREE=""
 
 declare -a TEAM_AGENT_NAMES=()
@@ -114,14 +111,14 @@ Commands:
 Platform policy:
   - Windows host + WSL environment only
   - repository path must be under /mnt/<drive>/...
-  - fixed team topology: lead + worker-N + utility-1
+  - fixed team topology: lead(external) + worker-1 + worker-2 + worker-3
 
 Common options:
   --repo PATH             Target repo path (default: current directory, supports C:\... auto-convert)
   --config PATH           Config path (default: <repo>/.codex-multi-agent.config.sh, supports C:\... auto-convert)
   --room NAME             Team bus room (default: main)
   --session NAME          Session/team name override
-  --workers N|auto        Worker pool size override (`auto`: adaptive 2..4)
+  --workers N             Worker count override (fixed policy: only `3` is accepted)
   --director-profile NAME Lead profile override (legacy flag name)
   --worker-profile NAME   Worker profile override
   --model MODEL           Set model for all roles
@@ -135,7 +132,11 @@ Backend options:
   --permission-mode MODE  default|acceptEdits|bypassPermissions|plan|delegate|dontAsk
   --plan-mode-required    Mark teammate config as plan-mode required
   config: AUTO_KILL_DONE_WORKER_TMUX=true|false (tmux mode에서 lead가 done 워커 pane/window 자동 종료)
-  config: LEAD_WORKTREE_NAME=lead-1 (리더 전용 worktree 이름)
+  config: ENABLE_TMUX_PULSE=true|false (tmux pane heartbeat window; 기본 false)
+  config: TMUX_MAILBOX_POLL_MS=1500 (tmux mailbox bridge poll interval, ms)
+  config: INPROCESS_POLL_MS=1000 (in-process mailbox poll interval, ms)
+  config: INPROCESS_IDLE_MS=12000 (in-process idle status cadence, ms)
+  lead runtime: external (current codex IDE/session)
 
 run/up options:
   --task TEXT             Initial task text (required for run)
@@ -546,76 +547,10 @@ window_exists() {
   tmux list-windows -t "$session" -F "#{window_name}" 2>/dev/null | grep -Fxq "$window_name"
 }
 
-orchestrator_pick_worker_count() {
-  local raw_task="$1"
-  local task
-  task="$(printf '%s' "$raw_task" | tr '[:upper:]' '[:lower:]')"
-  local words
-  words="$(printf '%s\n' "$task" | wc -w | tr -d ' ')"
-  local score=0
-  local domain_count=0
-  local separators=0
-  local reasons=()
-
-  if [[ "$words" -ge 35 ]]; then
-    score=$((score + 1))
-    reasons+=("long-brief")
-  fi
-  if [[ "$words" -ge 80 ]]; then
-    score=$((score + 1))
-    reasons+=("very-long-brief")
-  fi
-
-  [[ "$task" == *","* ]] && separators=$((separators + 1))
-  [[ "$task" == *";"* ]] && separators=$((separators + 1))
-  [[ "$task" == *$'\n'* ]] && separators=$((separators + 1))
-  [[ "$task" =~ [0-9]+\.[[:space:]] ]] && separators=$((separators + 1))
-  [[ "$task" == *" and "* ]] && separators=$((separators + 1))
-  if [[ "$separators" -ge 2 ]]; then
-    score=$((score + 1))
-    reasons+=("multi-subtasks")
-  fi
-
-  [[ "$task" =~ (ui|ux|frontend|react|vue|css|design|layout) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (backend|server|api|endpoint|controller|service) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (db|database|sql|schema|migration|postgres|mysql|sqlite|redis) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (test|testing|ci|e2e|integration|unit) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (deploy|docker|k8s|infra|terraform|pipeline|release) ]] && domain_count=$((domain_count + 1))
-  [[ "$task" =~ (docs|readme|documentation) ]] && domain_count=$((domain_count + 1))
-  if [[ "$domain_count" -ge 3 ]]; then
-    score=$((score + 1))
-    reasons+=("cross-domain")
-  fi
-  if [[ "$domain_count" -ge 5 ]]; then
-    score=$((score + 1))
-    reasons+=("wide-scope")
-  fi
-
-  if [[ "$task" =~ (refactor|migration|re-architect|rearchitect|rewrite|major|end-to-end|across) ]]; then
-    score=$((score + 1))
-    reasons+=("complex-change")
-  fi
-
-  local picked="2"
-  if [[ "$score" -ge 4 ]]; then
-    picked="4"
-  elif [[ "$score" -ge 2 ]]; then
-    picked="3"
-  fi
-
-  local reason="baseline"
-  if [[ "${#reasons[@]}" -gt 0 ]]; then
-    reason="$(IFS=,; echo "${reasons[*]}")"
-  fi
-
-  printf '%s|%s\n' "$picked" "$reason"
-}
-
 role_from_agent_name() {
   local agent="$1"
   case "$agent" in
     "$TEAM_LEAD_NAME") printf '%s\n' "lead" ;;
-    utility-*) printf '%s\n' "utility" ;;
     worker-*) printf '%s\n' "worker" ;;
     *) printf '%s\n' "worker" ;;
   esac
@@ -625,7 +560,6 @@ role_default_profile() {
   local role="$1"
   case "$role" in
     lead) printf '%s\n' "$LEAD_PROFILE" ;;
-    utility) printf '%s\n' "$UTILITY_PROFILE" ;;
     worker) printf '%s\n' "$WORKER_PROFILE" ;;
     *) printf '%s\n' "$WORKER_PROFILE" ;;
   esac
@@ -635,36 +569,22 @@ role_default_model() {
   local role="$1"
   case "$role" in
     lead) printf '%s\n' "$LEAD_MODEL" ;;
-    utility) printf '%s\n' "$UTILITY_MODEL" ;;
     worker) printf '%s\n' "$WORKER_MODEL" ;;
     *) printf '%s\n' "$WORKER_MODEL" ;;
   esac
 }
 
 role_peer_name() {
-  local agent="$1"
-  local role
-  role="$(role_from_agent_name "$agent")"
-  case "$role" in
-    worker) printf '%s\n' "$TEAM_LEAD_NAME" ;;
-    utility) printf '%s\n' "$TEAM_LEAD_NAME" ;;
-    *) printf '%s\n' "$TEAM_LEAD_NAME" ;;
-  esac
+  local _agent="$1"
+  printf '%s\n' "$TEAM_LEAD_NAME"
 }
 
 derive_role_team_shape() {
-  WORKER_COUNT="$COUNT"
-  if [[ "$WORKER_COUNT" -lt 2 ]]; then
-    WORKER_COUNT="2"
-    if [[ -n "$AUTO_WORKERS_REASON" ]]; then
-      AUTO_WORKERS_REASON="$AUTO_WORKERS_REASON,min-worker-pool"
-    else
-      AUTO_WORKERS_REASON="min-worker-pool"
-    fi
-    AUTO_WORKERS_APPLIED="true"
+  if [[ "$COUNT" != "3" ]]; then
+    echo "info: fixed worker policy active (forcing COUNT=3; requested: $COUNT)" >&2
   fi
-  UTILITY_COUNT="1"
-
+  COUNT="3"
+  WORKER_COUNT="3"
   TEAM_AGENT_NAMES=()
   TEAM_AGENT_ROLE=()
   TEAM_AGENT_PROFILE=()
@@ -681,16 +601,7 @@ derive_role_team_shape() {
     TEAM_AGENT_MODEL["$agent"]="$(role_default_model "$role")"
   done
 
-  for i in $(seq 1 "$UTILITY_COUNT"); do
-    agent="utility-$i"
-    role="utility"
-    TEAM_AGENT_NAMES+=("$agent")
-    TEAM_AGENT_ROLE["$agent"]="$role"
-    TEAM_AGENT_PROFILE["$agent"]="$(role_default_profile "$role")"
-    TEAM_AGENT_MODEL["$agent"]="$(role_default_model "$role")"
-  done
-
-  TEAM_ROLE_SUMMARY="lead=1 worker=$WORKER_COUNT utility=$UTILITY_COUNT"
+  TEAM_ROLE_SUMMARY="lead=1 worker=$WORKER_COUNT"
 }
 
 fs_cmd() {
@@ -698,10 +609,9 @@ fs_cmd() {
 }
 
 load_config_or_defaults() {
-  COUNT="2"
+  COUNT="3"
   PREFIX="worker"
   WORKTREES_DIR=".worktrees"
-  LEAD_WORKTREE_NAME="lead-1"
   BASE_REF="HEAD"
   USE_BASE_WIP="false"
   ALLOW_DIRTY="true"
@@ -711,8 +621,6 @@ load_config_or_defaults() {
   DIRECTOR_PROFILE="director"
   WORKER_PROFILE="pair"
   LEAD_PROFILE="$DIRECTOR_PROFILE"
-  UTILITY_PROFILE="$WORKER_PROFILE"
-  DIRECTOR_INPUT_DELAY="2"
   MERGE_STRATEGY="merge"
   TEAMMATE_MODE="in-process-shared"
   TMUX_LAYOUT="split"
@@ -720,6 +628,10 @@ load_config_or_defaults() {
   PLAN_MODE_REQUIRED="false"
   AUTO_DELEGATE="true"
   AUTO_KILL_DONE_WORKER_TMUX="true"
+  ENABLE_TMUX_PULSE="false"
+  TMUX_MAILBOX_POLL_MS="1500"
+  INPROCESS_POLL_MS="1000"
+  INPROCESS_IDLE_MS="12000"
   GIT_BIN="$(default_git_bin_for_repo "$REPO")"
 
   if [[ ! -f "$CONFIG" ]]; then
@@ -785,40 +697,21 @@ load_config_or_defaults() {
   if [[ -z "$LEAD_PROFILE" ]]; then
     LEAD_PROFILE="$DIRECTOR_PROFILE"
   fi
-  if [[ -z "$UTILITY_PROFILE" ]]; then
-    UTILITY_PROFILE="$WORKER_PROFILE"
-  fi
-
   if [[ -n "$WORKERS" ]]; then
-    if [[ "$WORKERS" == "auto" ]]; then
-      local orchestrator_decision
-      if [[ -n "$TASK" ]]; then
-        orchestrator_decision="$(orchestrator_pick_worker_count "$TASK")"
-      else
-        orchestrator_decision="2|manual-auto-no-task"
-      fi
-      COUNT="${orchestrator_decision%%|*}"
-      AUTO_WORKERS_REASON="${orchestrator_decision#*|}"
-      AUTO_WORKERS_APPLIED="true"
-    elif [[ "$WORKERS" =~ ^[0-9]+$ ]] && [[ "$WORKERS" -ge 2 ]]; then
-      COUNT="$WORKERS"
-    else
-      abort "--workers must be an integer >= 2 or 'auto'"
+    if [[ "$WORKERS" != "3" ]]; then
+      abort "--workers is fixed at 3 in external-lead topology"
     fi
+    COUNT="3"
   fi
 
   if [[ -n "$MODEL" ]]; then
     DIRECTOR_MODEL="$MODEL"
     WORKER_MODEL="$MODEL"
     LEAD_MODEL="$MODEL"
-    UTILITY_MODEL="$MODEL"
   fi
 
   if [[ -n "$DIRECTOR_MODEL" && -z "$LEAD_MODEL" ]]; then
     LEAD_MODEL="$DIRECTOR_MODEL"
-  fi
-  if [[ -n "$WORKER_MODEL" ]]; then
-    if [[ -z "$UTILITY_MODEL" ]]; then UTILITY_MODEL="$WORKER_MODEL"; fi
   fi
 
   if [[ -z "$DIRECTOR_MODEL" ]]; then
@@ -830,25 +723,13 @@ load_config_or_defaults() {
   if [[ -z "$WORKER_MODEL" ]]; then
     WORKER_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role worker --profile "$WORKER_PROFILE" 2>/dev/null || true)"
   fi
-  if [[ -z "$UTILITY_MODEL" ]]; then
-    UTILITY_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role utility --profile "$UTILITY_PROFILE" 2>/dev/null || true)"
-  fi
 
   if [[ -z "$LEAD_MODEL" ]]; then
     LEAD_MODEL="$DIRECTOR_MODEL"
   fi
-  if [[ -z "$UTILITY_MODEL" ]]; then
-    UTILITY_MODEL="$WORKER_MODEL"
-  fi
 
-  if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [[ "$COUNT" -lt 2 ]]; then
-    abort "worker count must be >= 2"
-  fi
-  if [[ -z "$LEAD_WORKTREE_NAME" ]]; then
-    abort "LEAD_WORKTREE_NAME must not be empty"
-  fi
-  if ! [[ "$DIRECTOR_INPUT_DELAY" =~ ^[0-9]+$ ]]; then
-    abort "DIRECTOR_INPUT_DELAY must be an integer"
+  if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+    abort "worker count must be numeric"
   fi
   case "$USE_BASE_WIP" in true|false) ;; *) abort "USE_BASE_WIP must be true/false" ;; esac
   case "$ALLOW_DIRTY" in true|false) ;; *) abort "ALLOW_DIRTY must be true/false" ;; esac
@@ -858,6 +739,16 @@ load_config_or_defaults() {
   case "$PLAN_MODE_REQUIRED" in true|false) ;; *) abort "PLAN_MODE_REQUIRED must be true|false" ;; esac
   case "$AUTO_DELEGATE" in true|false) ;; *) abort "AUTO_DELEGATE must be true|false" ;; esac
   case "$AUTO_KILL_DONE_WORKER_TMUX" in true|false) ;; *) abort "AUTO_KILL_DONE_WORKER_TMUX must be true|false" ;; esac
+  case "$ENABLE_TMUX_PULSE" in true|false) ;; *) abort "ENABLE_TMUX_PULSE must be true|false" ;; esac
+  if ! [[ "$TMUX_MAILBOX_POLL_MS" =~ ^[0-9]+$ ]] || [[ "$TMUX_MAILBOX_POLL_MS" -lt 100 ]]; then
+    abort "TMUX_MAILBOX_POLL_MS must be numeric and >= 100"
+  fi
+  if ! [[ "$INPROCESS_POLL_MS" =~ ^[0-9]+$ ]] || [[ "$INPROCESS_POLL_MS" -lt 100 ]]; then
+    abort "INPROCESS_POLL_MS must be numeric and >= 100"
+  fi
+  if ! [[ "$INPROCESS_IDLE_MS" =~ ^[0-9]+$ ]] || [[ "$INPROCESS_IDLE_MS" -lt 1000 ]]; then
+    abort "INPROCESS_IDLE_MS must be numeric and >= 1000"
+  fi
 
   derive_role_team_shape
 
@@ -869,7 +760,7 @@ load_config_or_defaults() {
   TASKS_DIR="$TEAM_ROOT/tasks"
   LOG_DIR="$TEAM_ROOT/logs"
   WORKTREES_ROOT="$(abs_path_from "$REPO" "$WORKTREES_DIR")"
-  LEAD_WORKTREE="$(abs_path_from "$WORKTREES_ROOT" "$LEAD_WORKTREE_NAME")"
+  LEAD_WORKTREE="$REPO"
 
   RESOLVED_BACKEND="$(resolve_teammate_backend "$TEAMMATE_MODE" || true)"
   if [[ -z "$RESOLVED_BACKEND" ]]; then
@@ -955,13 +846,10 @@ create_or_refresh_team_context() {
     --agent-type "$LEAD_AGENT_TYPE" \
     --lead-name "$TEAM_LEAD_NAME" \
     --model "$LEAD_MODEL" \
-    --cwd "$LEAD_WORKTREE" \
-    --backend-type "$RESOLVED_BACKEND" \
-    --mode "$RESOLVED_BACKEND" \
+    --cwd "$REPO" \
+    --backend-type "external" \
+    --mode "external" \
     "${replace_arg[@]}" >/dev/null
-
-  # Keep lead/member mode aligned with the enforced runtime backend policy.
-  fs_cmd member-mode --repo "$REPO" --session "$TMUX_SESSION" --ident "$TEAM_LEAD_NAME" --mode "$RESOLVED_BACKEND" >/dev/null || true
 
   local worker_backend="$RESOLVED_BACKEND"
 
@@ -1000,7 +888,7 @@ create_or_refresh_team_context() {
 
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
-    --body "team_created name=$team_name session=$TMUX_SESSION roles=[$TEAM_ROLE_SUMMARY] members=$total_members mode=$RESOLVED_BACKEND layout=$TMUX_LAYOUT" >/dev/null
+    --body "team_created name=$team_name session=$TMUX_SESSION roles=[$TEAM_ROLE_SUMMARY] members=$total_members runtime_members=${#TEAM_AGENT_NAMES[@]} lead_mode=external mode=$RESOLVED_BACKEND layout=$TMUX_LAYOUT" >/dev/null
 }
 
 ensure_worktrees() {
@@ -1032,13 +920,10 @@ ensure_worktrees() {
   fi
 
   local name
-  local worktree_targets=("$LEAD_WORKTREE_NAME" "${TEAM_AGENT_NAMES[@]}")
+  local worktree_targets=("${TEAM_AGENT_NAMES[@]}")
   for name in "${worktree_targets[@]}"; do
     local branch="ma/$name"
     local wt_path="$WORKTREES_ROOT/$name"
-    if [[ "$name" == "$LEAD_WORKTREE_NAME" ]]; then
-      wt_path="$LEAD_WORKTREE"
-    fi
     local wt_path_for_git
     wt_path_for_git="$(repo_path_for_git_bin "$GIT_BIN" "$wt_path")"
     local worktree_list
@@ -1113,7 +998,7 @@ if [[ -z "\$agent_name" ]]; then
     agent_name="\$TEAM_LEAD_NAME_VALUE"
     agent_role="lead"
   elif [[ "\$role_profile" == "\$WORKER_PROFILE_VALUE" ]]; then
-    if [[ "\$base_name" =~ ^(worker|utility)-[0-9]+$ ]]; then
+    if [[ "\$base_name" =~ ^worker-[0-9]+$ ]]; then
       agent_name="\$base_name"
     else
       agent_name="worker-agent"
@@ -1201,8 +1086,8 @@ set_tmux_pane_color() {
 }
 
 launch_tmux_split_backend() {
-  if [[ ! -d "$LEAD_WORKTREE" ]]; then
-    abort "missing lead worktree: $LEAD_WORKTREE"
+  if [[ "${#TEAM_AGENT_NAMES[@]}" -lt 1 ]]; then
+    abort "no runtime agents configured"
   fi
   if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
     if [[ "$KILL_EXISTING_SESSION" == "true" ]]; then
@@ -1216,24 +1101,34 @@ launch_tmux_split_backend() {
     fi
   fi
 
-  tmux new-session -d -s "$TMUX_SESSION" -n "$SWARM_WINDOW" -c "$LEAD_WORKTREE"
+  local first_agent="${TEAM_AGENT_NAMES[0]}"
+  local first_path="$WORKTREES_ROOT/$first_agent"
+  if [[ ! -d "$first_path" ]]; then
+    abort "missing worktree: $first_path"
+  fi
+
+  tmux new-session -d -s "$TMUX_SESSION" -n "$SWARM_WINDOW" -c "$first_path"
   tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
   tmux set-option -t "$TMUX_SESSION" -g pane-border-status top >/dev/null 2>&1 || true
   tmux set-option -t "$TMUX_SESSION" -g pane-border-format '#{pane_title}' >/dev/null 2>&1 || true
 
-  tmux select-pane -t "$TMUX_SESSION:$SWARM_WINDOW.0" -T "$TEAM_LEAD_NAME"
-  local director_cmd
-  local lead_boot_prompt
-  lead_boot_prompt="$(agent_boot_prompt "$TEAM_LEAD_NAME")"
-  director_cmd="$(make_pane_command "$TEAM_LEAD_NAME" "lead" "$LEAD_PROFILE" "$LEAD_WORKTREE" "$LEAD_MODEL" "$lead_boot_prompt")"
-  tmux send-keys -t "$TMUX_SESSION:$SWARM_WINDOW.0" "$director_cmd" C-m
-  local lead_pane
-  lead_pane="$(tmux display-message -p -t "$TMUX_SESSION:$SWARM_WINDOW.0" '#{pane_id}')"
-  record_tmux_runtime "$TEAM_LEAD_NAME" "$lead_pane" "$SWARM_WINDOW"
-  set_tmux_pane_color "$TMUX_SESSION:$SWARM_WINDOW.0" "$TEAM_LEAD_NAME"
+  tmux select-pane -t "$TMUX_SESSION:$SWARM_WINDOW.0" -T "$first_agent"
+  local first_role="${TEAM_AGENT_ROLE[$first_agent]}"
+  local first_profile="${TEAM_AGENT_PROFILE[$first_agent]}"
+  local first_model="${TEAM_AGENT_MODEL[$first_agent]}"
+  local first_boot_prompt
+  first_boot_prompt="$(agent_boot_prompt "$first_agent")"
+  local first_cmd
+  first_cmd="$(make_pane_command "$first_agent" "$first_role" "$first_profile" "$first_path" "$first_model" "$first_boot_prompt")"
+  tmux send-keys -t "$TMUX_SESSION:$SWARM_WINDOW.0" "$first_cmd" C-m
+  local first_pane
+  first_pane="$(tmux display-message -p -t "$TMUX_SESSION:$SWARM_WINDOW.0" '#{pane_id}')"
+  record_tmux_runtime "$first_agent" "$first_pane" "$SWARM_WINDOW"
+  set_tmux_pane_color "$TMUX_SESSION:$SWARM_WINDOW.0" "$first_agent"
 
-  local agent
-  for agent in "${TEAM_AGENT_NAMES[@]}"; do
+  local idx agent
+  for ((idx=1; idx<${#TEAM_AGENT_NAMES[@]}; idx++)); do
+    agent="${TEAM_AGENT_NAMES[$idx]}"
     local wt_path="$WORKTREES_ROOT/$agent"
     local role="${TEAM_AGENT_ROLE[$agent]}"
     local profile="${TEAM_AGENT_PROFILE[$agent]}"
@@ -1264,8 +1159,8 @@ launch_tmux_split_backend() {
 }
 
 launch_tmux_window_backend() {
-  if [[ ! -d "$LEAD_WORKTREE" ]]; then
-    abort "missing lead worktree: $LEAD_WORKTREE"
+  if [[ "${#TEAM_AGENT_NAMES[@]}" -lt 1 ]]; then
+    abort "no runtime agents configured"
   fi
   if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
     if [[ "$KILL_EXISTING_SESSION" == "true" ]]; then
@@ -1279,21 +1174,31 @@ launch_tmux_window_backend() {
     fi
   fi
 
-  tmux new-session -d -s "$TMUX_SESSION" -n "$TEAM_LEAD_NAME" -c "$LEAD_WORKTREE"
-  tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
-  local lead_cmd
-  local lead_boot_prompt
-  lead_boot_prompt="$(agent_boot_prompt "$TEAM_LEAD_NAME")"
-  lead_cmd="$(make_pane_command "$TEAM_LEAD_NAME" "lead" "$LEAD_PROFILE" "$LEAD_WORKTREE" "$LEAD_MODEL" "$lead_boot_prompt")"
-  tmux send-keys -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" "$lead_cmd" C-m
-  local lead_pane
-  lead_pane="$(tmux display-message -p -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" '#{pane_id}')"
-  record_tmux_runtime "$TEAM_LEAD_NAME" "$lead_pane" "$TEAM_LEAD_NAME"
-  tmux select-pane -t "$TMUX_SESSION:$TEAM_LEAD_NAME.0" -T "$TEAM_LEAD_NAME"
-  set_tmux_pane_color "$TMUX_SESSION:$TEAM_LEAD_NAME.0" "$TEAM_LEAD_NAME"
+  local first_agent="${TEAM_AGENT_NAMES[0]}"
+  local first_path="$WORKTREES_ROOT/$first_agent"
+  if [[ ! -d "$first_path" ]]; then
+    abort "missing worktree: $first_path"
+  fi
 
-  local agent
-  for agent in "${TEAM_AGENT_NAMES[@]}"; do
+  tmux new-session -d -s "$TMUX_SESSION" -n "$first_agent" -c "$first_path"
+  tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
+  local first_role="${TEAM_AGENT_ROLE[$first_agent]}"
+  local first_profile="${TEAM_AGENT_PROFILE[$first_agent]}"
+  local first_model="${TEAM_AGENT_MODEL[$first_agent]}"
+  local first_boot_prompt
+  first_boot_prompt="$(agent_boot_prompt "$first_agent")"
+  local first_cmd
+  first_cmd="$(make_pane_command "$first_agent" "$first_role" "$first_profile" "$first_path" "$first_model" "$first_boot_prompt")"
+  tmux send-keys -t "$TMUX_SESSION:$first_agent.0" "$first_cmd" C-m
+  local first_pane
+  first_pane="$(tmux display-message -p -t "$TMUX_SESSION:$first_agent.0" '#{pane_id}')"
+  record_tmux_runtime "$first_agent" "$first_pane" "$first_agent"
+  tmux select-pane -t "$TMUX_SESSION:$first_agent.0" -T "$first_agent"
+  set_tmux_pane_color "$TMUX_SESSION:$first_agent.0" "$first_agent"
+
+  local idx agent
+  for ((idx=1; idx<${#TEAM_AGENT_NAMES[@]}; idx++)); do
+    agent="${TEAM_AGENT_NAMES[$idx]}"
     local wt_path="$WORKTREES_ROOT/$agent"
     local role="${TEAM_AGENT_ROLE[$agent]}"
     local profile="${TEAM_AGENT_PROFILE[$agent]}"
@@ -1315,31 +1220,20 @@ launch_tmux_window_backend() {
     set_tmux_pane_color "$TMUX_SESSION:$agent.0" "$agent"
   done
 
-  tmux select-window -t "$TMUX_SESSION:$TEAM_LEAD_NAME"
+  tmux select-window -t "$TMUX_SESSION:$first_agent"
 }
 
 spawn_inprocess_backend() {
   require_cmd nohup
   mkdir -p "$LOG_DIR"
 
-  local inprocess_agents=("$TEAM_LEAD_NAME" "${TEAM_AGENT_NAMES[@]}")
+  local inprocess_agents=("${TEAM_AGENT_NAMES[@]}")
   local agent
   for agent in "${inprocess_agents[@]}"; do
-    local wt_path
-    local role
-    local profile
-    local model
-    if [[ "$agent" == "$TEAM_LEAD_NAME" ]]; then
-      wt_path="$LEAD_WORKTREE"
-      role="lead"
-      profile="$LEAD_PROFILE"
-      model="$LEAD_MODEL"
-    else
-      wt_path="$WORKTREES_ROOT/$agent"
-      role="${TEAM_AGENT_ROLE[$agent]}"
-      profile="${TEAM_AGENT_PROFILE[$agent]}"
-      model="${TEAM_AGENT_MODEL[$agent]}"
-    fi
+    local wt_path="$WORKTREES_ROOT/$agent"
+    local role="${TEAM_AGENT_ROLE[$agent]}"
+    local profile="${TEAM_AGENT_PROFILE[$agent]}"
+    local model="${TEAM_AGENT_MODEL[$agent]}"
     if [[ ! -d "$wt_path" ]]; then
       echo "skip missing worktree: $wt_path" >&2
       continue
@@ -1357,6 +1251,8 @@ spawn_inprocess_backend() {
       --profile "$profile"
       --model "$model"
       --codex-bin "$CODEX_BIN"
+      --poll-ms "$INPROCESS_POLL_MS"
+      --idle-ms "$INPROCESS_IDLE_MS"
       --permission-mode "$PERMISSION_MODE"
     )
     if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
@@ -1377,7 +1273,7 @@ spawn_inprocess_shared_backend() {
   mkdir -p "$LOG_DIR"
 
   local hub_log="$LOG_DIR/inprocess-hub.log"
-  local hub_agents=("$TEAM_LEAD_NAME" "${TEAM_AGENT_NAMES[@]}")
+  local hub_agents=("${TEAM_AGENT_NAMES[@]}")
   local hub_count="${#hub_agents[@]}"
   local agents_csv
   agents_csv="$(IFS=,; echo "${hub_agents[*]}")"
@@ -1393,10 +1289,12 @@ spawn_inprocess_shared_backend() {
     --profile "$WORKER_PROFILE"
     --model "$WORKER_MODEL"
     --lead-name "$TEAM_LEAD_NAME"
-    --lead-cwd "$LEAD_WORKTREE"
+    --lead-cwd "$REPO"
     --lead-profile "$LEAD_PROFILE"
     --lead-model "$LEAD_MODEL"
     --codex-bin "$CODEX_BIN"
+    --poll-ms "$INPROCESS_POLL_MS"
+    --idle-ms "$INPROCESS_IDLE_MS"
     --permission-mode "$PERMISSION_MODE"
   )
   if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
@@ -1434,16 +1332,21 @@ launch_aux_windows() {
       "TEAM_DB='$DB' '$DASHBOARD_SCRIPT' --session '$TMUX_SESSION' --repo '$REPO' --room '$ROOM' --lines '$DASHBOARD_LINES' --messages '$DASHBOARD_MESSAGES'" C-m
   fi
 
-  if window_exists "$TMUX_SESSION" "$PULSE_WINDOW"; then
+  if parse_bool_env "$ENABLE_TMUX_PULSE"; then
+    if window_exists "$TMUX_SESSION" "$PULSE_WINDOW"; then
+      tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" C-c >/dev/null 2>&1 || true
+    else
+      tmux new-window -t "$TMUX_SESSION" -n "$PULSE_WINDOW" -c "$REPO"
+    fi
+    tmux select-pane -t "$TMUX_SESSION:$PULSE_WINDOW.0" -T "pulse" >/dev/null 2>&1 || true
+    local pulse_agents
+    pulse_agents="$(IFS=,; echo "${TEAM_AGENT_NAMES[*]}")"
+    tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" \
+      "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --agents-csv '$pulse_agents' --lead-name '$TEAM_LEAD_NAME'" C-m
+  elif window_exists "$TMUX_SESSION" "$PULSE_WINDOW"; then
     tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" C-c >/dev/null 2>&1 || true
-  else
-    tmux new-window -t "$TMUX_SESSION" -n "$PULSE_WINDOW" -c "$REPO"
+    tmux kill-window -t "$TMUX_SESSION:$PULSE_WINDOW" >/dev/null 2>&1 || true
   fi
-  tmux select-pane -t "$TMUX_SESSION:$PULSE_WINDOW.0" -T "pulse" >/dev/null 2>&1 || true
-  local pulse_agents
-  pulse_agents="$(IFS=,; echo "${TEAM_AGENT_NAMES[*]}")"
-  tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" \
-    "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --agents-csv '$pulse_agents' --lead-name '$TEAM_LEAD_NAME'" C-m
 
   if window_exists "$TMUX_SESSION" "$MAILBOX_WINDOW"; then
     tmux send-keys -t "$TMUX_SESSION:$MAILBOX_WINDOW" C-c >/dev/null 2>&1 || true
@@ -1452,7 +1355,7 @@ launch_aux_windows() {
   fi
   tmux select-pane -t "$TMUX_SESSION:$MAILBOX_WINDOW.0" -T "mailbox-bridge" >/dev/null 2>&1 || true
   tmux send-keys -t "$TMUX_SESSION:$MAILBOX_WINDOW" \
-    "python3 '$TMUX_MAILBOX_BRIDGE' --repo '$REPO' --session '$TMUX_SESSION' --room '$ROOM' --tmux-session '$TMUX_SESSION' --lead-name '$TEAM_LEAD_NAME' --auto-kill-done-workers '$AUTO_KILL_DONE_WORKER_TMUX'" C-m
+    "python3 '$TMUX_MAILBOX_BRIDGE' --repo '$REPO' --session '$TMUX_SESSION' --room '$ROOM' --tmux-session '$TMUX_SESSION' --lead-name '$TEAM_LEAD_NAME' --auto-kill-done-workers '$AUTO_KILL_DONE_WORKER_TMUX' --poll-ms '$TMUX_MAILBOX_POLL_MS'" C-m
 }
 
 role_primary_objective() {
@@ -1460,9 +1363,6 @@ role_primary_objective() {
   case "$role" in
     worker)
       printf '%s\n' "Implement scoped code changes with minimal blast radius and provide concrete validation output."
-      ;;
-    utility)
-      printf '%s\n' "Own git/release operations: integrate approved changes, push branch, and execute merge flow with traceable logs."
       ;;
     *)
       printf '%s\n' "Execute assigned scope and provide auditable evidence."
@@ -1483,16 +1383,9 @@ build_role_task_prompt() {
   local role_specific_contract=""
   if [[ "$role" == "worker" ]]; then
     role_specific_contract="$(cat <<EOF
-7. Maintain continuous peer collaboration: when your output depends on another worker/utility, send \`question\` and keep Q/A looping until dependency is closed.
+7. Maintain continuous peer collaboration: when your output depends on another worker, send \`question\` and keep Q/A looping until dependency is closed.
 8. If anything is unknown mid-task, ask lead immediately with \`question\` (summary: research-request); do not guess critical requirements.
-9. If lead responds with refined guidance/research, convert it into concrete next edits/tests and report back with \`status\`.
-EOF
-)"
-  elif [[ "$role" == "utility" ]]; then
-    role_specific_contract="$(cat <<EOF
-7. Keep continuous sync with workers on release-impacting changes; resolve interface gaps through \`question\`/\`answer\` loops.
-8. If release/merge context is unclear, ask lead and wait for explicit handoff approval.
-9. Use the configured git binary for push/merge operations when available: \`"$GIT_BIN"\`.
+9. If lead assigns merge/release ownership, execute it using configured git binary: \`"$GIT_BIN"\`.
 EOF
 )"
   fi
@@ -1514,7 +1407,7 @@ Execution contract:
 4. Send progress and completion updates:
    codex-teams sendmessage --session "$TMUX_SESSION" --room "$ROOM" --type status --from "$agent" --to "$TEAM_LEAD_NAME" --summary "<progress|done|blocker>" --content "<update>"
 5. Include evidence in done: changed files + validation command outputs + residual risk.
-6. Utility handoff: once lead approves completion, utility handles git push and merge flow.
+6. Finalization handoff: once lead approves completion, an assigned worker handles git push/merge flow.
 $role_specific_contract
 EOF
 }
@@ -1531,10 +1424,10 @@ $task_text
 Operating policy:
 1. Perform requirement analysis and research synthesis.
 2. Produce a concrete execution plan.
-3. Adjust worker allocation within configured worker pool.
+3. Operate fixed runtime topology: worker-1, worker-2, worker-3 (no worker scaling).
 4. Delegate implementation tasks to worker-* agents.
-5. Coordinate in real time, intervene on blockers, and keep worker/utility collaboration loops active until resolution.
-6. Handoff approved changes to utility-1 for git push and merge workflow.
+5. Coordinate in real time, intervene on blockers, and keep worker-to-worker collaboration loops active until resolution.
+6. Assign one worker for final git push/merge workflow after review approval.
 7. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
 8. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
 
@@ -1549,7 +1442,6 @@ prepare_initial_boot_prompts() {
     return 0
   fi
 
-  BOOT_PROMPT_BY_AGENT["$TEAM_LEAD_NAME"]="$(build_lead_task_prompt "$TASK")"
   if [[ "$AUTO_DELEGATE" != "true" ]]; then
     return 0
   fi
@@ -1566,7 +1458,7 @@ prepare_initial_boot_prompts() {
 
 announce_collaboration_workflow() {
   local workflow_summary
-  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(continuous)->on-demand-research-by-lead->lead-review->utility-push/merge; lead=orchestration-only; unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=default-worker-pool-2(expand-with---workers)"
+  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(continuous)->on-demand-research-by-lead->lead-review->assigned-worker-push/merge; lead=orchestration-only(external-session); unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=fixed-worker-pool-3"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status --body "$workflow_summary" >/dev/null
   fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from orchestrator --recipient all --summary "workflow-fixed" --content "$workflow_summary" >/dev/null || true
 }
@@ -1617,12 +1509,6 @@ inject_initial_task() {
   lead_task_prompt="$(build_lead_task_prompt "$TASK")"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to "$TEAM_LEAD_NAME" --kind task --body "$lead_task_prompt" >/dev/null
   fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from system --recipient "$TEAM_LEAD_NAME" --content "$lead_task_prompt" --summary "lead-mission" >/dev/null
-  if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
-    if ! boot_prompt_available "$TEAM_LEAD_NAME"; then
-      sleep "$DIRECTOR_INPUT_DELAY"
-      tmux_send_worker_task "$TEAM_LEAD_NAME" "$lead_task_prompt" || true
-    fi
-  fi
 
   if [[ "$AUTO_DELEGATE" == "true" ]]; then
     delegate_initial_task_to_role_agents "$TASK"
@@ -1640,15 +1526,17 @@ print_start_summary() {
   if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
     echo "- tmux layout: $TMUX_LAYOUT"
     echo "- tmux mailbox bridge window: $MAILBOX_WINDOW"
+    echo "- tmux mailbox bridge poll(ms): $TMUX_MAILBOX_POLL_MS"
+    echo "- tmux pulse enabled: $ENABLE_TMUX_PULSE"
     echo "- tmux auto-kill done worker: $AUTO_KILL_DONE_WORKER_TMUX"
   fi
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
+  local runtime_members="${#TEAM_AGENT_NAMES[@]}"
   echo "- role members: $total_members ($TEAM_ROLE_SUMMARY)"
-  echo "- lead worktree: $LEAD_WORKTREE"
+  echo "- runtime members: $runtime_members (workers only)"
+  echo "- lead runtime: external (current codex session)"
+  echo "- lead cwd: $LEAD_WORKTREE"
   echo "- worker pool: $WORKER_COUNT"
-  if [[ "$AUTO_WORKERS_APPLIED" == "true" ]]; then
-    echo "- worker scaling: auto ($AUTO_WORKERS_REASON)"
-  fi
   echo "- auto delegate: $AUTO_DELEGATE"
   echo "- room: $ROOM"
   echo "- bus db: $DB"
@@ -1656,13 +1544,17 @@ print_start_summary() {
   echo "- team config: $TEAM_CONFIG"
   echo "- state: $TEAM_ROOT/state.json"
   echo "- viewer bridge: $REPO/$VIEWER_BRIDGE_FILE"
-  if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" || -n "$UTILITY_MODEL" ]]; then
-    echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>} utility=${UTILITY_MODEL:-<default>}"
+  if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" ]]; then
+    echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>}"
   fi
   if [[ "$RESOLVED_BACKEND" == "in-process" ]]; then
     echo "- logs: $LOG_DIR/<agent>.log"
   elif [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
     echo "- logs: $LOG_DIR/inprocess-hub.log"
+  fi
+  if [[ "$RESOLVED_BACKEND" == "in-process" || "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
+    echo "- in-process poll(ms): $INPROCESS_POLL_MS"
+    echo "- in-process idle(ms): $INPROCESS_IDLE_MS"
   fi
   echo "- status: TEAM_DB='$DB' '$STATUS' --room '$ROOM'"
   echo "- mailbox: TEAM_DB='$DB' '$MAILBOX' --repo '$REPO' --session '$TMUX_SESSION' inbox <agent> --unread"
@@ -1704,12 +1596,9 @@ run_swarm() {
   write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
 
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
+  local runtime_members="${#TEAM_AGENT_NAMES[@]}"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
-    --body "session=$TMUX_SESSION started via codex-teams backend=$RESOLVED_BACKEND members=$total_members role_shape=[$TEAM_ROLE_SUMMARY] layout=$TMUX_LAYOUT permission_mode=$PERMISSION_MODE" >/dev/null
-  if [[ "$AUTO_WORKERS_APPLIED" == "true" ]]; then
-    python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status \
-      --body "auto-worker-scaling selected worker_pool=$WORKER_COUNT role_shape=[$TEAM_ROLE_SUMMARY] reason=$AUTO_WORKERS_REASON" >/dev/null
-  fi
+    --body "session=$TMUX_SESSION started via codex-teams backend=$RESOLVED_BACKEND members=$total_members runtime_members=$runtime_members lead_mode=external role_shape=[$TEAM_ROLE_SUMMARY] layout=$TMUX_LAYOUT permission_mode=$PERMISSION_MODE" >/dev/null
   announce_collaboration_workflow
 
   inject_initial_task
@@ -1898,17 +1787,16 @@ ensure_default_project_config() {
   cat > "$config_path" <<'EOF'
 #!/usr/bin/env bash
 # Project config for codex multi-agent orchestration.
-# Topology is fixed by codex-teams runtime: lead x1 + worker xN + utility x1.
+# Topology is fixed by codex-teams runtime: lead(external) x1 + worker x3.
 
-# Number of workers (pair sessions).
-COUNT=2
+# Number of workers (fixed policy).
+COUNT=3
 
-# Worker naming prefix: worker-1 ... worker-N
+# Worker naming prefix: worker-1, worker-2, worker-3
 PREFIX="worker"
 
 # Where worker worktrees are created (relative to repo root or absolute path).
 WORKTREES_DIR=".worktrees"
-LEAD_WORKTREE_NAME="lead-1"
 
 # Base commit/ref for new worker branches.
 BASE_REF="HEAD"
@@ -1928,19 +1816,20 @@ CODEX_BIN="codex"
 DIRECTOR_PROFILE="director"
 WORKER_PROFILE="pair"
 
-# If run command is used, wait this many seconds before sending director task.
-DIRECTOR_INPUT_DELAY="2"
-
 # Merge mode when integrating workers: merge or cherry-pick
 MERGE_STRATEGY="merge"
 
-# Backend default (tmux keeps teammates running even after launcher shell exits).
-TEAMMATE_MODE="tmux"
+# Backend default (resource-lean shared supervisor).
+TEAMMATE_MODE="in-process-shared"
 TMUX_LAYOUT="split"
 PERMISSION_MODE="default"
 PLAN_MODE_REQUIRED="false"
 AUTO_DELEGATE="true"
 AUTO_KILL_DONE_WORKER_TMUX="true"
+ENABLE_TMUX_PULSE="false"
+TMUX_MAILBOX_POLL_MS="1500"
+INPROCESS_POLL_MS="1000"
+INPROCESS_IDLE_MS="12000"
 
 # Git selection (default: WSL git to avoid Windows conhost.exe overhead).
 GIT_BIN="git"

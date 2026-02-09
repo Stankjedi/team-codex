@@ -4,12 +4,12 @@ model = "gpt-5.3-codex"
 
 [codex_teams]
 model = "gpt-5.3-codex"
-lead_model = "gpt-5.3-codex"
+lead_model = "gpt-5.2"
 worker_model = "gpt-5.3-codex"
 utility_model = "gpt-5.3-codex"
 
 [profiles.director]
-model = "gpt-5.3-codex"
+model = "gpt-5.2"
 model_reasoning_effort = "xhigh"
 
 [profiles.pair]

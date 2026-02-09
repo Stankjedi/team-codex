@@ -7,7 +7,7 @@
 
 - 플랫폼: Windows + WSL (권장 WSL2)
 - 저장소 경로: `/mnt/<drive>/...` (예: `/mnt/c/...`)
-- 팀 토폴로지: `lead x1 + worker xN + utility x1` (고정 정책)
+- 팀 토폴로지: `lead(external) x1 + worker x3` (고정 정책)
 - Git 기본값: WSL `git` (Windows `git.exe`는 옵트인)
 - 경로 자동 변환: `--repo`, `--config`, `--git-bin`에 `C:\...` 입력 가능
 
@@ -71,7 +71,7 @@ codex-teams setup --repo /mnt/c/Users/<you>/project
 2. 팀 컨텍스트 생성
 
 ```bash
-codex-teams teamcreate --repo /mnt/c/Users/<you>/project --session codex-fleet --workers 2 --description "Repo task force"
+codex-teams teamcreate --repo /mnt/c/Users/<you>/project --session codex-fleet --workers 3 --description "Repo task force"
 ```
 
 3. 실행
@@ -96,9 +96,8 @@ codex-teams sendmessage --repo /mnt/c/Users/<you>/project --session codex-fleet 
 
 | 위치 | 설명 |
 |---|---|
-| `.worktrees/lead-1` | lead 작업 워크트리 (기본값) |
-| `.worktrees/worker-<n>` | worker 작업 워크트리 |
-| `.worktrees/utility-1` | utility 작업 워크트리 |
+| `<repo-root>` | lead 작업 위치 (현재 Codex IDE 세션, 외부 리더) |
+| `.worktrees/worker-1`, `.worktrees/worker-2`, `.worktrees/worker-3` | worker 작업 워크트리 |
 | `.codex-teams/<session>/bus.sqlite` | 팀 메시지 버스 DB |
 | `.codex-teams/<session>/inboxes/` | 에이전트 메일박스 |
 | `.codex-teams/<session>/logs/` | 런타임 로그 |
@@ -111,19 +110,22 @@ codex-teams sendmessage --repo /mnt/c/Users/<you>/project --session codex-fleet 
 
 - 백엔드: `tmux | in-process | in-process-shared`
 - 기본 엔진 값: `in-process-shared`
-- 실사용 기본값: `setup`이 생성한 `.codex-multi-agent.config.sh`에서 `TEAMMATE_MODE="tmux"`
+- 실사용 기본값: `setup`이 생성한 `.codex-multi-agent.config.sh`에서 `TEAMMATE_MODE="in-process-shared"`
 - `--teammate-mode auto` 해석:
   - non-interactive: `in-process`
   - interactive + tmux 내부: `tmux`
   - interactive + tmux 외부: `in-process`
+- tmux 부하 제어 기본값:
+  - `ENABLE_TMUX_PULSE="false"` (pulse window 비활성)
+  - `TMUX_MAILBOX_POLL_MS="1500"` (메일박스 브리지 폴링 간격 완화)
 - 작업 디렉터리:
-  - lead: `.worktrees/lead-1` (기본)
-  - worker/utility: `.worktrees/<agent>`
+  - lead: `<repo-root>` (외부 리더, 현재 Codex 세션)
+  - worker: `.worktrees/<agent>`
 
 예시:
 
 ```bash
-codex-teams run --repo /mnt/c/Users/<you>/project --session codex-fleet --task "대규모 작업" --workers auto
+codex-teams run --repo /mnt/c/Users/<you>/project --session codex-fleet --task "대규모 작업" --workers 3
 codex-teams run --repo /mnt/c/Users/<you>/project --session codex-fleet --task "백그라운드" --teammate-mode in-process --no-attach
 codex-teams run --repo /mnt/c/Users/<you>/project --session codex-fleet --task "tmux split" --teammate-mode tmux --tmux-layout split --dashboard
 codex-teams run --repo /mnt/c/Users/<you>/project --session codex-fleet --task "수동 분배" --no-auto-delegate
@@ -150,7 +152,7 @@ codex-teams setup --repo /mnt/c/Users/<you>/project
 
 주요 옵션:
 
-- `--workers N|auto`: 워커 수 지정 (`auto`는 task 난이도 기반 2~4)
+- `--workers N`: 워커 수 지정 (고정 정책으로 `3`만 허용)
 - `--teammate-mode auto|tmux|in-process|in-process-shared`
 - `--tmux-layout split|window`
 - `--dashboard`, `--dashboard-window`, `--dashboard-lines`, `--dashboard-messages`
@@ -170,7 +172,7 @@ codex-teams status --repo /mnt/c/Users/<you>/project --session codex-fleet
 팀 컨텍스트를 명시적으로 생성/삭제합니다.
 
 ```bash
-codex-teams teamcreate --repo /mnt/c/Users/<you>/project --session codex-fleet --workers 2 --description "..."
+codex-teams teamcreate --repo /mnt/c/Users/<you>/project --session codex-fleet --workers 3 --description "..."
 codex-teams teamdelete --repo /mnt/c/Users/<you>/project --session codex-fleet --force
 ```
 
@@ -210,10 +212,9 @@ cp .codex-multi-agent.config.example.sh .codex-multi-agent.config.sh
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `COUNT` | `2` | 기본 워커 수 |
+| `COUNT` | `3` | 기본 워커 수 |
 | `PREFIX` | `worker` | 워커 이름 prefix |
 | `WORKTREES_DIR` | `.worktrees` | worktree 루트 디렉터리 |
-| `LEAD_WORKTREE_NAME` | `lead-1` | lead worktree 이름 |
 | `BASE_REF` | `HEAD` | worktree 분기 기준 ref |
 | `USE_BASE_WIP` | `false` | tracked 변경 snapshot 기반 사용 여부 |
 | `ALLOW_DIRTY` | `true` | dirty tree 허용 여부 |
@@ -221,15 +222,18 @@ cp .codex-multi-agent.config.example.sh .codex-multi-agent.config.sh
 | `KILL_EXISTING_SESSION` | `false` | 기존 세션 강제 종료 여부 |
 | `CODEX_BIN` | `codex` | Codex 실행 바이너리 |
 | `DIRECTOR_PROFILE` | `director` | lead 기본 프로필 |
-| `WORKER_PROFILE` | `pair` | worker/utility 기본 프로필 |
-| `DIRECTOR_INPUT_DELAY` | `2` | run 시 lead 초기 입력 지연(초) |
+| `WORKER_PROFILE` | `pair` | worker 기본 프로필 |
 | `MERGE_STRATEGY` | `merge` | 통합 전략 (`merge`/`cherry-pick`) |
-| `TEAMMATE_MODE` | `tmux` (생성 config 기준) | 기본 백엔드 |
+| `TEAMMATE_MODE` | `in-process-shared` (생성 config 기준) | 기본 백엔드 |
 | `TMUX_LAYOUT` | `split` | tmux 레이아웃 |
 | `PERMISSION_MODE` | `default` | Codex permission mode |
 | `PLAN_MODE_REQUIRED` | `false` | plan mode 요구 여부 |
 | `AUTO_DELEGATE` | `true` | 초기 task 자동 분배 여부 |
 | `AUTO_KILL_DONE_WORKER_TMUX` | `true` | done 워커 pane/window 자동 정리 |
+| `ENABLE_TMUX_PULSE` | `false` | tmux `team-pulse` 윈도우 활성화 여부 |
+| `TMUX_MAILBOX_POLL_MS` | `1500` | tmux 메일박스 브리지 폴링 간격(ms) |
+| `INPROCESS_POLL_MS` | `1000` | in-process 메일박스 폴링 간격(ms) |
+| `INPROCESS_IDLE_MS` | `12000` | in-process idle 상태 전송 간격(ms) |
 | `GIT_BIN` | `git` | git 실행 바이너리 |
 | `CODEX_TEAM_GIT_BIN` | `$GIT_BIN` | 팀 런타임용 git 바이너리 |
 
@@ -289,6 +293,19 @@ codex-teams setup --repo /mnt/c/Users/<you>/project
 - `--task`를 실행 가능한 단위로 작성
 - `codex-teams status --repo <repo> --session <session>` 확인
 - tmux 모드에서는 `team-mailbox` 윈도우에서 메시지 주입이 진행되는지 확인
+
+### CPU/RAM 사용량이 치솟을 때
+
+- 우선 `TEAMMATE_MODE="in-process-shared"` 기본값을 유지하세요.
+- tmux 모드가 필요하면 아래처럼 부하를 낮추세요.
+
+```bash
+ENABLE_TMUX_PULSE="false"
+TMUX_MAILBOX_POLL_MS="1500"
+INPROCESS_POLL_MS="1000"
+```
+
+- `codex-teams status --repo <repo> --session <session>`에서 백엔드/런타임 수가 의도(lead external + worker 3)와 일치하는지 확인하세요.
 
 ### worktree에서 파일이 안 보일 때
 

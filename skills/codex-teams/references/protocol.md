@@ -21,7 +21,7 @@ Platform:
   - `.codex-teams/<session>/state.json`
   - `.codex-teams/<session>/runtime.json`
 - initializes `.codex-teams/<session>/bus.sqlite`
-- registers team members in bus (`lead`, `worker-N`, `utility-1`, `system`, `monitor`, `orchestrator`)
+- registers team members in bus (`lead`, `worker-1`, `worker-2`, `worker-3`, `system`, `monitor`, `orchestrator`)
 
 2. `run/up`
 - selects backend:
@@ -33,28 +33,32 @@ Platform:
     - non-interactive -> `in-process`
     - interactive + inside tmux -> `tmux`
     - interactive + outside tmux -> `in-process`
-- `tmux` backend starts `swarm` + `team-monitor` + `team-pulse` windows
+- `tmux` backend starts `swarm` + `team-monitor` windows (`swarm`에는 worker pane만 생성)
+- `team-pulse` window is optional (`ENABLE_TMUX_PULSE=true` when needed)
 - `tmux` backend starts `team-mailbox` bridge window to inject unread mailbox messages into panes
 - `in-process` backends run mailbox poll loops and emit lifecycle status via bus/fs
-- `in-process` backends auto-reply to non-lead teammate senders for continuous worker/utility collaboration
-- emits startup `system` and worker-scaling `status` messages
-- `--workers auto` uses adaptive worker-pool scaling in range `2..4`
-- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(continuous) -> on-demand-research-by-lead -> lead-review -> utility-push/merge`
+- `in-process` backends auto-reply to non-lead teammate senders for continuous worker collaboration
+- default perf knobs:
+  - `TEAMMATE_MODE=in-process-shared`
+  - `TMUX_MAILBOX_POLL_MS=1500`
+  - `INPROCESS_POLL_MS=1000`
+- emits startup `system` status messages
+- fixed worker pool policy: `worker-1`, `worker-2`, `worker-3` only (`--workers` accepts only `3`)
+- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(continuous) -> on-demand-research-by-lead -> lead-review -> assigned-worker-push/merge`
 - lead는 orchestration-only로 유지되며 구현 태스크를 직접 수행하지 않음
-- default auto-delegates initial task from `lead` to each worker/utility agent with role-specific execution prompt
+- default auto-delegates initial task from `lead` to each worker agent with role-specific execution prompt
 
 3. `teamdelete`
 - removes team directory (and force-kills active runtime agents/tmux session when `--force`)
 
 ## Roles
 
-- `lead`: orchestration-only, staffing/delegation/intervention owner, worker 질문 수신 시 리서치 후 `answer/task`로 재전달
-- `worker-N`: implementation execution
-- `utility-1`: git/release/deploy utility owner
+- `lead`: orchestration-only (external current session), delegation/intervention owner, worker 질문 수신 시 리서치 후 `answer/task`로 재전달
+- `worker-1`, `worker-2`, `worker-3`: implementation execution
 - `monitor`: read-only tail of all traffic
 - `system`: lifecycle notices
-- `orchestrator`: auto-scaling/coordination notices
-- fixed topology contract: `lead + worker-N + utility-1`
+- `orchestrator`: coordination notices
+- fixed topology contract: `lead(external) + worker-1 + worker-2 + worker-3`
 
 ## Message Kinds
 
