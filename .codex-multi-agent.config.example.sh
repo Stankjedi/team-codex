@@ -46,6 +46,12 @@ TMUX_MAILBOX_POLL_MS="1500"
 INPROCESS_POLL_MS="1000"
 # in-process idle status cadence(ms).
 INPROCESS_IDLE_MS="12000"
+# in-process-shared startup stabilize window(sec). 이 시간 동안 생존해야 startup 성공으로 간주.
+INPROCESS_SHARED_STABILIZE_SEC="12"
+# in-process-shared startup retry count (total attempts = retries + 1).
+INPROCESS_SHARED_START_RETRIES="1"
+# 동일 세션/레포 병렬 제어 경합 방지를 위한 lock wait timeout(sec).
+SESSION_LOCK_WAIT_SEC="20"
 
 # Git selection (WSL)
 # Default recommendation: keep WSL git to avoid Windows conhost.exe overhead.

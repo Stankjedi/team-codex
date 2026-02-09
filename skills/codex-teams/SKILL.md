@@ -30,6 +30,10 @@ Codex CLI + tmux/in-process + SQLite bus + filesystem mailbox 기반 멀티 에�
 codex-teams setup --repo <repo>
 ```
 `<repo>`는 `/mnt/<drive>/...`(예: `/mnt/c/...`) 경로여야 합니다.
+필요하면 먼저 의존성 자동 설치를 실행하세요:
+```bash
+codex-teams deps --install
+```
 
 3. Create team context (`TeamCreate` equivalent):
 ```bash
@@ -118,11 +122,19 @@ Performance defaults:
 - tmux bridge poll default: `TMUX_MAILBOX_POLL_MS=1500`
 - tmux pulse default: `ENABLE_TMUX_PULSE=false`
 - in-process poll default: `INPROCESS_POLL_MS=1000`
+- in-process-shared startup stabilize: `INPROCESS_SHARED_STABILIZE_SEC=12`
+- in-process-shared startup retries: `INPROCESS_SHARED_START_RETRIES=1`
+- session/repo lock wait: `SESSION_LOCK_WAIT_SEC=20`
 
 in-process mode layout:
 - no tmux session required
 - worker teammate runs mailbox poll loop (`team_inprocess_agent.py`)
 - optional shared supervisor mode (`team_inprocess_hub.py`)
+- shared mode 진단 파일:
+  - `<repo>/.codex-teams/<session>/logs/inprocess-hub.log`
+  - `<repo>/.codex-teams/<session>/logs/inprocess-hub.lifecycle.log`
+  - `<repo>/.codex-teams/<session>/logs/inprocess-hub.heartbeat.json`
+- 동일 session에서 in-process 런타임이 이미 살아있으면 `run/up`은 중복 기동을 차단
 
 This gives Claude Teams-style parallel visibility while keeping Codex CLI sessions native.
 

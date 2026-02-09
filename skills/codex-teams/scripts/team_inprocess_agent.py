@@ -46,14 +46,17 @@ def on_signal(signum: int, _frame: object) -> None:
 
 
 def run_cmd(cmd: list[str], *, cwd: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return 127, f"failed to execute {' '.join(cmd)}: {exc}"
     return proc.returncode, proc.stdout or ""
 
 

@@ -62,6 +62,13 @@ ENABLE_TMUX_PULSE="false"
 TMUX_MAILBOX_POLL_MS="1500"
 INPROCESS_POLL_MS="1000"
 INPROCESS_IDLE_MS="12000"
+# in-process-shared startup 안정성 확인 구간(초).
+INPROCESS_SHARED_STABILIZE_SEC="12"
+# startup 실패 시 재시도 횟수(총 시도 횟수 = retries + 1).
+INPROCESS_SHARED_START_RETRIES="1"
+# 동일 세션/레포 병렬 제어 충돌 방지 lock 대기 시간(초).
+SESSION_LOCK_WAIT_SEC="20"
+DEPS_INSTALL="false"
 
 MESSAGE_TYPE="message"
 MESSAGE_SENDER=""
@@ -83,6 +90,12 @@ TEAM_ROLE_SUMMARY=""
 NORMALIZED_TEAMMATE_MODE=""
 LEAD_WORKTREE=""
 INPROCESS_HUB_AGENT="inprocess-hub"
+AUTO_DEP_PM=""
+AUTO_DEP_UPDATED="false"
+LOCK_TRAP_INSTALLED="false"
+HELD_LOCK_MODE=""
+HELD_LOCK_PATH=""
+HELD_LOCK_FD=""
 
 declare -a TEAM_AGENT_NAMES=()
 declare -A TEAM_AGENT_ROLE=()
@@ -98,6 +111,7 @@ Usage:
   team_codex.sh <command> [options]
 
 Commands:
+  deps                    Check/install runtime dependencies (separate from setup)
   init                    Initialize project config for codex-teams
   setup                   Prepare repository (git init + initial commit) for codex-teams
   run                     TeamCreate + spawn teammates + inject task
@@ -136,6 +150,9 @@ Backend options:
   config: TMUX_MAILBOX_POLL_MS=1500 (tmux mailbox bridge poll interval, ms)
   config: INPROCESS_POLL_MS=1000 (in-process mailbox poll interval, ms)
   config: INPROCESS_IDLE_MS=12000 (in-process idle status cadence, ms)
+  config: INPROCESS_SHARED_STABILIZE_SEC=12 (in-process-shared startup stability window, sec)
+  config: INPROCESS_SHARED_START_RETRIES=1 (in-process-shared startup retry count)
+  config: SESSION_LOCK_WAIT_SEC=20 (session/repo lock wait timeout, sec)
   lead runtime: external (current codex IDE/session)
 
 run/up options:
@@ -168,7 +185,12 @@ sendmessage options:
   --approve               Mark response as approved
   --reject                Mark response as rejected
 
+deps options:
+  --install               Attempt to install missing dependencies via package manager
+
 Examples:
+  team_codex.sh deps
+  team_codex.sh deps --install
   team_codex.sh setup --repo .
   team_codex.sh run --task "Fix flaky tests" --teammate-mode in-process-shared --no-attach
   team_codex.sh run --task "UI pass" --teammate-mode tmux --tmux-layout split --dashboard
@@ -187,6 +209,323 @@ require_cmd() {
   if ! command -v "$cmd" >/dev/null 2>&1; then
     abort "required command not found: $cmd"
   fi
+}
+
+now_utc_iso() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+release_command_lock() {
+  if [[ -z "$HELD_LOCK_PATH" ]]; then
+    return 0
+  fi
+
+  case "$HELD_LOCK_MODE" in
+    flock)
+      if [[ -n "$HELD_LOCK_FD" ]]; then
+        flock -u "$HELD_LOCK_FD" >/dev/null 2>&1 || true
+        eval "exec ${HELD_LOCK_FD}>&-"
+      fi
+      ;;
+    mkdir)
+      rm -rf "$HELD_LOCK_PATH" >/dev/null 2>&1 || true
+      ;;
+    *)
+      ;;
+  esac
+
+  HELD_LOCK_MODE=""
+  HELD_LOCK_PATH=""
+  HELD_LOCK_FD=""
+}
+
+ensure_lock_cleanup_trap() {
+  if [[ "$LOCK_TRAP_INSTALLED" == "true" ]]; then
+    return 0
+  fi
+  trap 'release_command_lock' EXIT
+  LOCK_TRAP_INSTALLED="true"
+}
+
+acquire_lock_with_flock() {
+  local lock_path="$1"
+  local wait_sec="$2"
+  local lock_label="$3"
+  local fd
+
+  exec {fd}>"$lock_path"
+  if ! flock -w "$wait_sec" "$fd"; then
+    eval "exec ${fd}>&-"
+    return 1
+  fi
+
+  HELD_LOCK_MODE="flock"
+  HELD_LOCK_PATH="$lock_path"
+  HELD_LOCK_FD="$fd"
+  echo "$(now_utc_iso) lock-acquired method=flock label=$lock_label pid=$$" >> "${lock_path}.events.log" 2>/dev/null || true
+  return 0
+}
+
+acquire_lock_with_mkdir() {
+  local lock_path="$1"
+  local wait_sec="$2"
+  local lock_label="$3"
+  local lock_dir="${lock_path}.dirlock"
+  local deadline=$((SECONDS + wait_sec))
+
+  while true; do
+    if mkdir "$lock_dir" >/dev/null 2>&1; then
+      printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || true
+      HELD_LOCK_MODE="mkdir"
+      HELD_LOCK_PATH="$lock_dir"
+      echo "$(now_utc_iso) lock-acquired method=mkdir label=$lock_label pid=$$" >> "${lock_path}.events.log" 2>/dev/null || true
+      return 0
+    fi
+
+    local owner_pid=""
+    if [[ -f "$lock_dir/pid" ]]; then
+      owner_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    fi
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" >/dev/null 2>&1; then
+      rm -rf "$lock_dir" >/dev/null 2>&1 || true
+      continue
+    fi
+
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+acquire_command_lock() {
+  local lock_path="$1"
+  local lock_label="$2"
+  local wait_sec="$3"
+
+  mkdir -p "$(dirname "$lock_path")"
+  ensure_lock_cleanup_trap
+
+  if [[ -n "$HELD_LOCK_PATH" ]]; then
+    case "$HELD_LOCK_MODE" in
+      flock)
+        if [[ "$HELD_LOCK_PATH" == "$lock_path" ]]; then
+          return 0
+        fi
+        ;;
+      mkdir)
+        if [[ "$HELD_LOCK_PATH" == "${lock_path}.dirlock" ]]; then
+          return 0
+        fi
+        ;;
+      *)
+        ;;
+    esac
+    abort "internal lock state mismatch while requesting $lock_label lock"
+  fi
+
+  if command -v flock >/dev/null 2>&1; then
+    if acquire_lock_with_flock "$lock_path" "$wait_sec" "$lock_label"; then
+      return 0
+    fi
+  fi
+
+  if acquire_lock_with_mkdir "$lock_path" "$wait_sec" "$lock_label"; then
+    return 0
+  fi
+
+  abort "timed out waiting for $lock_label lock (${wait_sec}s): $lock_path"
+}
+
+acquire_repo_lock() {
+  local lock_path="$REPO/.codex-teams/.repo.lock"
+  acquire_command_lock "$lock_path" "repo" "$SESSION_LOCK_WAIT_SEC"
+}
+
+acquire_session_lock() {
+  local lock_path="$REPO/.codex-teams/$TMUX_SESSION/.session.lock"
+  acquire_command_lock "$lock_path" "session=$TMUX_SESSION" "$SESSION_LOCK_WAIT_SEC"
+}
+
+detect_package_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    printf '%s\n' "apt-get"
+    return 0
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    printf '%s\n' "dnf"
+    return 0
+  fi
+  if command -v yum >/dev/null 2>&1; then
+    printf '%s\n' "yum"
+    return 0
+  fi
+  if command -v pacman >/dev/null 2>&1; then
+    printf '%s\n' "pacman"
+    return 0
+  fi
+  if command -v zypper >/dev/null 2>&1; then
+    printf '%s\n' "zypper"
+    return 0
+  fi
+  if command -v apk >/dev/null 2>&1; then
+    printf '%s\n' "apk"
+    return 0
+  fi
+  return 1
+}
+
+run_with_privilege() {
+  if [[ "$EUID" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return $?
+  fi
+  return 127
+}
+
+package_name_for_command() {
+  local pm="$1"
+  local cmd="$2"
+  case "$cmd" in
+    git)
+      printf '%s\n' "git"
+      ;;
+    python3)
+      printf '%s\n' "python3"
+      ;;
+    sqlite3)
+      case "$pm" in
+        apt-get)
+          printf '%s\n' "sqlite3"
+          ;;
+        dnf|yum|pacman|zypper|apk)
+          printf '%s\n' "sqlite"
+          ;;
+        *)
+          printf '%s\n' "sqlite3"
+          ;;
+      esac
+      ;;
+    tmux)
+      printf '%s\n' "tmux"
+      ;;
+    wslpath)
+      case "$pm" in
+        apt-get)
+          printf '%s\n' "wslu"
+          ;;
+        *)
+          printf '%s\n' ""
+          ;;
+      esac
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
+install_package_with_manager() {
+  local pm="$1"
+  local pkg="$2"
+  case "$pm" in
+    apt-get)
+      if [[ "$AUTO_DEP_UPDATED" != "true" ]]; then
+        run_with_privilege apt-get update -y
+        AUTO_DEP_UPDATED="true"
+      fi
+      run_with_privilege apt-get install -y --no-install-recommends "$pkg"
+      ;;
+    dnf)
+      run_with_privilege dnf install -y "$pkg"
+      ;;
+    yum)
+      run_with_privilege yum install -y "$pkg"
+      ;;
+    pacman)
+      run_with_privilege pacman -Sy --noconfirm --needed "$pkg"
+      ;;
+    zypper)
+      run_with_privilege zypper --non-interactive install -y "$pkg"
+      ;;
+    apk)
+      run_with_privilege apk add --no-cache "$pkg"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_dependency_command() {
+  local cmd="$1"
+  local action="${2:-check}"
+
+  if command -v "$cmd" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "$action" != "install" ]]; then
+    return 1
+  fi
+
+  if [[ -z "$AUTO_DEP_PM" ]]; then
+    AUTO_DEP_PM="$(detect_package_manager || true)"
+  fi
+  if [[ -z "$AUTO_DEP_PM" ]]; then
+    return 1
+  fi
+
+  local pkg
+  pkg="$(package_name_for_command "$AUTO_DEP_PM" "$cmd")"
+  if [[ -z "$pkg" ]]; then
+    return 1
+  fi
+
+  echo "missing dependency '$cmd'. attempting install via $AUTO_DEP_PM (package: $pkg) ..."
+  if ! install_package_with_manager "$AUTO_DEP_PM" "$pkg"; then
+    return 1
+  fi
+
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "installed dependency '$cmd' successfully."
+    return 0
+  fi
+
+  return 1
+}
+
+dependency_status_line() {
+  local cmd="$1"
+  local required="${2:-required}"
+  local install_mode="${3:-false}"
+
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "[ok] $cmd -> $(command -v "$cmd")"
+    return 0
+  fi
+
+  if [[ "$install_mode" == "true" ]]; then
+    if ensure_dependency_command "$cmd" "install"; then
+      echo "[installed] $cmd -> $(command -v "$cmd")"
+      return 0
+    fi
+  fi
+
+  local severity="optional"
+  if [[ "$required" == "required" ]]; then
+    severity="required"
+  fi
+  echo "[missing] $cmd ($severity)"
+
+  if [[ "$required" == "required" ]]; then
+    return 2
+  fi
+  return 1
 }
 
 resolve_executable_cmd() {
@@ -238,13 +577,17 @@ is_wsl_environment() {
   return 1
 }
 
-require_windows_wsl_runtime() {
+require_windows_wsl_runtime_base() {
   if ! is_wsl_environment; then
     abort "codex-teams is Windows+WSL only. Run this command inside WSL on a Windows host."
   fi
   if [[ ! -d "/mnt/c" ]]; then
     abort "missing Windows mount (/mnt/c). ensure WSL is configured with Windows drive mounts enabled."
   fi
+}
+
+require_windows_wsl_runtime() {
+  require_windows_wsl_runtime_base
   if ! command -v wslpath >/dev/null 2>&1; then
     abort "wslpath not found. install/restore WSL utilities before running codex-teams."
   fi
@@ -632,6 +975,9 @@ load_config_or_defaults() {
   TMUX_MAILBOX_POLL_MS="1500"
   INPROCESS_POLL_MS="1000"
   INPROCESS_IDLE_MS="12000"
+  INPROCESS_SHARED_STABILIZE_SEC="12"
+  INPROCESS_SHARED_START_RETRIES="1"
+  SESSION_LOCK_WAIT_SEC="20"
   GIT_BIN="$(default_git_bin_for_repo "$REPO")"
 
   if [[ ! -f "$CONFIG" ]]; then
@@ -749,6 +1095,15 @@ load_config_or_defaults() {
   fi
   if ! [[ "$INPROCESS_IDLE_MS" =~ ^[0-9]+$ ]] || [[ "$INPROCESS_IDLE_MS" -lt 1000 ]]; then
     abort "INPROCESS_IDLE_MS must be numeric and >= 1000"
+  fi
+  if ! [[ "$INPROCESS_SHARED_STABILIZE_SEC" =~ ^[0-9]+$ ]] || [[ "$INPROCESS_SHARED_STABILIZE_SEC" -lt 1 ]]; then
+    abort "INPROCESS_SHARED_STABILIZE_SEC must be numeric and >= 1"
+  fi
+  if ! [[ "$INPROCESS_SHARED_START_RETRIES" =~ ^[0-9]+$ ]]; then
+    abort "INPROCESS_SHARED_START_RETRIES must be numeric and >= 0"
+  fi
+  if ! [[ "$SESSION_LOCK_WAIT_SEC" =~ ^[0-9]+$ ]] || [[ "$SESSION_LOCK_WAIT_SEC" -lt 1 ]]; then
+    abort "SESSION_LOCK_WAIT_SEC must be numeric and >= 1"
   fi
 
   derive_role_team_shape
@@ -1086,6 +1441,58 @@ set_tmux_pane_color() {
   tmux select-pane -t "$pane_target" -P "pane-active-border-style=fg=$border" >/dev/null 2>&1 || true
 }
 
+spawn_detached_to_log() {
+  local log_file="$1"
+  shift
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" </dev/null >"$log_file" 2>&1 &
+  else
+    require_cmd nohup
+    nohup "$@" </dev/null >"$log_file" 2>&1 &
+  fi
+  local pid=$!
+  printf '%s\n' "$pid"
+}
+
+process_alive() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+process_survives_window() {
+  local pid="$1"
+  local window_sec="$2"
+
+  if [[ "$window_sec" -le 0 ]]; then
+    process_alive "$pid"
+    return $?
+  fi
+
+  local ticks=$((window_sec * 4))
+  local i
+  for ((i=0; i<ticks; i++)); do
+    if ! process_alive "$pid"; then
+      return 1
+    fi
+    sleep 0.25
+  done
+
+  process_alive "$pid"
+}
+
+show_process_failure_hint() {
+  local label="$1"
+  local pid="$2"
+  local log_file="$3"
+
+  echo "$label exited during startup window (pid=$pid). log: $log_file" >&2
+  if [[ -f "$log_file" ]]; then
+    tail -n 60 "$log_file" >&2 || true
+  fi
+}
+
 launch_tmux_split_backend() {
   if [[ "${#TEAM_AGENT_NAMES[@]}" -lt 1 ]]; then
     abort "no runtime agents configured"
@@ -1225,7 +1632,6 @@ launch_tmux_window_backend() {
 }
 
 spawn_inprocess_backend() {
-  require_cmd nohup
   mkdir -p "$LOG_DIR"
 
   local inprocess_agents=("${TEAM_AGENT_NAMES[@]}")
@@ -1260,20 +1666,26 @@ spawn_inprocess_backend() {
       args+=(--plan-mode-required)
     fi
 
-    nohup "${args[@]}" >"$log_file" 2>&1 &
-    local pid=$!
+    local pid
+    pid="$(spawn_detached_to_log "$log_file" "${args[@]}")"
 
     fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --backend in-process --status running --pid "$pid" --window in-process >/dev/null
     python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role "$role" >/dev/null
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status --body "spawned in-process agent=$agent pid=$pid log=$log_file" >/dev/null
+
+    if ! process_alive "$pid"; then
+      python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind blocker \
+        --body "in-process agent exited immediately agent=$agent pid=$pid log=$log_file" >/dev/null || true
+    fi
   done
 }
 
 spawn_inprocess_shared_backend() {
-  require_cmd nohup
   mkdir -p "$LOG_DIR"
 
   local hub_log="$LOG_DIR/inprocess-hub.log"
+  local hub_lifecycle="$LOG_DIR/inprocess-hub.lifecycle.log"
+  local hub_heartbeat="$LOG_DIR/inprocess-hub.heartbeat.json"
   local hub_agents=("${TEAM_AGENT_NAMES[@]}")
   local hub_count="${#hub_agents[@]}"
   local agents_csv
@@ -1297,18 +1709,49 @@ spawn_inprocess_shared_backend() {
     --poll-ms "$INPROCESS_POLL_MS"
     --idle-ms "$INPROCESS_IDLE_MS"
     --permission-mode "$PERMISSION_MODE"
+    --heartbeat-file "$hub_heartbeat"
+    --lifecycle-log "$hub_lifecycle"
   )
   if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
     args+=(--plan-mode-required)
   fi
 
-  nohup "${args[@]}" >"$hub_log" 2>&1 &
-  local pid=$!
+  local max_attempts=$((INPROCESS_SHARED_START_RETRIES + 1))
+  local attempt
+  local pid=""
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    printf '%s startup-attempt=%s/%s session=%s backend=in-process-shared\n' \
+      "$(now_utc_iso)" "$attempt" "$max_attempts" "$TMUX_SESSION" >> "$hub_lifecycle" 2>/dev/null || true
 
-  fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$INPROCESS_HUB_AGENT" \
-    --backend in-process-shared --status running --pid "$pid" --window in-process-shared >/dev/null
-  python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
-    --body "spawned in-process shared hub pid=$pid members=$hub_count roles=[$TEAM_ROLE_SUMMARY] log=$hub_log" >/dev/null
+    pid="$(spawn_detached_to_log "$hub_log" "${args[@]}")"
+    fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$INPROCESS_HUB_AGENT" \
+      --backend in-process-shared --status running --pid "$pid" --window in-process-shared >/dev/null
+
+    if process_survives_window "$pid" "$INPROCESS_SHARED_STABILIZE_SEC"; then
+      printf '%s startup-stable pid=%s stabilize_sec=%s attempt=%s\n' \
+        "$(now_utc_iso)" "$pid" "$INPROCESS_SHARED_STABILIZE_SEC" "$attempt" >> "$hub_lifecycle" 2>/dev/null || true
+      python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
+        --body "spawned in-process shared hub pid=$pid members=$hub_count roles=[$TEAM_ROLE_SUMMARY] log=$hub_log stabilize_sec=$INPROCESS_SHARED_STABILIZE_SEC startup_attempt=$attempt" >/dev/null
+      return 0
+    fi
+
+    printf '%s startup-failed pid=%s stabilize_sec=%s attempt=%s\n' \
+      "$(now_utc_iso)" "$pid" "$INPROCESS_SHARED_STABILIZE_SEC" "$attempt" >> "$hub_lifecycle" 2>/dev/null || true
+    python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind blocker \
+      --body "in-process shared hub exited during startup window pid=$pid attempt=$attempt/$max_attempts stabilize_sec=$INPROCESS_SHARED_STABILIZE_SEC log=$hub_log lifecycle=$hub_lifecycle" >/dev/null || true
+    show_process_failure_hint "in-process shared hub" "$pid" "$hub_log"
+    fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$INPROCESS_HUB_AGENT" --status terminated >/dev/null || true
+    if process_alive "$pid"; then
+      kill "$pid" >/dev/null 2>&1 || true
+      sleep 0.2
+      if process_alive "$pid"; then
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+      fi
+    fi
+    sleep 0.5
+  done
+
+  abort "in-process shared hub failed startup stability check (${INPROCESS_SHARED_STABILIZE_SEC}s, attempts=$max_attempts). check: $hub_log $hub_lifecycle"
 }
 
 launch_aux_windows() {
@@ -1559,9 +2002,67 @@ print_start_summary() {
     echo "- in-process poll(ms): $INPROCESS_POLL_MS"
     echo "- in-process idle(ms): $INPROCESS_IDLE_MS"
   fi
+  if [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
+    echo "- shared startup stabilize(sec): $INPROCESS_SHARED_STABILIZE_SEC"
+    echo "- shared startup retries: $INPROCESS_SHARED_START_RETRIES"
+  fi
+  echo "- command lock wait(sec): $SESSION_LOCK_WAIT_SEC"
   echo "- status: TEAM_DB='$DB' '$STATUS' --room '$ROOM'"
   echo "- mailbox: TEAM_DB='$DB' '$MAILBOX' --repo '$REPO' --session '$TMUX_SESSION' inbox <agent> --unread"
   echo "- control: TEAM_DB='$DB' '$CONTROL' --repo '$REPO' --session '$TMUX_SESSION' request --type plan_approval <from> <to> <body>"
+}
+
+count_alive_runtime_processes() {
+  python3 - "$TEAM_ROOT/runtime.json" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+alive = 0
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        runtime = json.load(f)
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
+agents = runtime.get("agents", {})
+if not isinstance(agents, dict):
+    print(0)
+    raise SystemExit(0)
+
+for record in agents.values():
+    if not isinstance(record, dict):
+        continue
+    if str(record.get("status", "")) != "running":
+        continue
+    backend = str(record.get("backend", ""))
+    if backend not in {"in-process", "in-process-shared"}:
+        continue
+    pid = int(record.get("pid", 0) or 0)
+    if pid <= 0:
+        continue
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        continue
+    alive += 1
+
+print(alive)
+PY
+}
+
+guard_existing_inprocess_runtime() {
+  if [[ "$RESOLVED_BACKEND" != "in-process" && "$RESOLVED_BACKEND" != "in-process-shared" ]]; then
+    return 0
+  fi
+
+  local alive_count
+  alive_count="$(count_alive_runtime_processes)"
+  if [[ "$alive_count" =~ ^[0-9]+$ ]] && [[ "$alive_count" -gt 0 ]]; then
+    abort "active in-process runtime already exists for session '$TMUX_SESSION' (alive=$alive_count). use status/teamdelete --force first."
+  fi
 }
 
 run_swarm() {
@@ -1569,11 +2070,13 @@ run_swarm() {
   require_cmd python3
   CODEX_BIN="$(require_subprocess_executable "$CODEX_BIN" "codex binary")"
   require_repo_ready_for_run
+  acquire_session_lock
 
   if [[ "$COMMAND" == "run" && -z "$TASK" ]]; then
     abort "--task is required for run"
   fi
 
+  guard_existing_inprocess_runtime
   init_bus_and_dirs
   ensure_worktrees
   create_or_refresh_team_context true
@@ -1667,6 +2170,19 @@ PY
   echo ""
   echo "[filesystem state]"
   fs_cmd state-get --repo "$REPO" --session "$TMUX_SESSION" --compact || true
+
+  if [[ -f "$LOG_DIR/inprocess-hub.heartbeat.json" || -f "$LOG_DIR/inprocess-hub.lifecycle.log" ]]; then
+    echo ""
+    echo "[inprocess-shared diagnostics]"
+    if [[ -f "$LOG_DIR/inprocess-hub.heartbeat.json" ]]; then
+      echo "heartbeat-file=$LOG_DIR/inprocess-hub.heartbeat.json"
+      cat "$LOG_DIR/inprocess-hub.heartbeat.json" 2>/dev/null || true
+    fi
+    if [[ -f "$LOG_DIR/inprocess-hub.lifecycle.log" ]]; then
+      echo "lifecycle-log=$LOG_DIR/inprocess-hub.lifecycle.log"
+      tail -n 10 "$LOG_DIR/inprocess-hub.lifecycle.log" 2>/dev/null || true
+    fi
+  fi
 
   if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
     echo ""
@@ -1816,6 +2332,7 @@ PY
 
 cmd_teamcreate() {
   load_config_or_defaults
+  acquire_session_lock
   init_bus_and_dirs
   create_or_refresh_team_context "$TEAMCREATE_REPLACE"
   write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
@@ -1879,6 +2396,9 @@ ENABLE_TMUX_PULSE="false"
 TMUX_MAILBOX_POLL_MS="1500"
 INPROCESS_POLL_MS="1000"
 INPROCESS_IDLE_MS="12000"
+INPROCESS_SHARED_STABILIZE_SEC="12"
+INPROCESS_SHARED_START_RETRIES="1"
+SESSION_LOCK_WAIT_SEC="20"
 
 # Git selection (default: WSL git to avoid Windows conhost.exe overhead).
 GIT_BIN="git"
@@ -1892,9 +2412,57 @@ EOF
   chmod +x "$config_path" >/dev/null 2>&1 || true
 }
 
+cmd_deps() {
+  require_windows_wsl_runtime_base
+
+  local install_mode="$DEPS_INSTALL"
+  if [[ "$install_mode" == "true" ]]; then
+    AUTO_DEP_PM="$(detect_package_manager || true)"
+    if [[ -z "$AUTO_DEP_PM" ]]; then
+      echo "no supported package manager detected; install mode cannot run automatically." >&2
+    else
+      echo "dependency auto-install mode enabled (package manager: $AUTO_DEP_PM)"
+    fi
+  fi
+
+  local rc=0
+  local dep_cmd dep_required
+  local deps=(
+    "git|required"
+    "python3|required"
+    "wslpath|required"
+    "codex|required"
+    "sqlite3|optional"
+    "tmux|optional"
+  )
+
+  for spec in "${deps[@]}"; do
+    dep_cmd="${spec%%|*}"
+    dep_required="${spec##*|}"
+    if ! dependency_status_line "$dep_cmd" "$dep_required" "$install_mode"; then
+      local dep_rc=$?
+      if [[ "$dep_rc" -eq 2 ]]; then
+        rc=2
+      elif [[ "$rc" -eq 0 ]]; then
+        rc=1
+      fi
+    fi
+  done
+
+  if [[ "$rc" -eq 0 ]]; then
+    echo "dependency check complete: all required dependencies are available."
+  elif [[ "$rc" -eq 1 ]]; then
+    echo "dependency check complete: required dependencies are available, optional dependencies are missing."
+  else
+    echo "dependency check complete: required dependencies are missing."
+  fi
+  return "$rc"
+}
+
 cmd_setup() {
   local git_bin="$BOOT_GIT_BIN"
   require_cmd "$git_bin"
+  acquire_repo_lock
 
   local requested_repo="$REPO"
   local requested_repo_for_git
@@ -2053,6 +2621,7 @@ cmd_merge() {
 
 cmd_teamdelete() {
   load_config_or_defaults
+  acquire_session_lock
 
   if [[ "$DELETE_FORCE" == "true" ]]; then
     force_terminate_runtime_agents
@@ -2195,6 +2764,7 @@ PY
 
 cmd_sendmessage() {
   load_config_or_defaults
+  acquire_session_lock
   init_bus_and_dirs
 
   if [[ -z "$MESSAGE_SENDER" ]]; then
@@ -2350,7 +2920,7 @@ parse_args() {
   shift
 
   case "$COMMAND" in
-    init|setup|run|up|status|merge|teamcreate|teamdelete|sendmessage) ;;
+    deps|init|setup|run|up|status|merge|teamcreate|teamdelete|sendmessage) ;;
     -h|--help)
       usage
       exit 0
@@ -2360,7 +2930,11 @@ parse_args() {
       ;;
   esac
 
-  require_windows_wsl_runtime
+  if [[ "$COMMAND" == "deps" ]]; then
+    require_windows_wsl_runtime_base
+  else
+    require_windows_wsl_runtime
+  fi
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2466,6 +3040,13 @@ parse_args() {
         DELETE_FORCE="true"
         shift
         ;;
+      --install)
+        if [[ "$COMMAND" != "deps" ]]; then
+          abort "--install is only supported with deps command"
+        fi
+        DEPS_INSTALL="true"
+        shift
+        ;;
       --teammate-mode)
         TEAMMATE_MODE="$2"
         TEAMMATE_MODE_OVERRIDE="$2"
@@ -2559,6 +3140,10 @@ parse_args() {
     esac
   done
 
+  if [[ "$COMMAND" == "deps" ]]; then
+    return 0
+  fi
+
   REPO="$(normalize_input_path_for_wsl "$REPO")"
   if [[ -n "$CONFIG" ]]; then
     CONFIG="$(normalize_input_path_for_wsl "$CONFIG")"
@@ -2611,6 +3196,10 @@ main() {
   esac
 
   case "$COMMAND" in
+    deps)
+      cmd_deps
+      ;;
+
     init)
       cmd_init
       ;;

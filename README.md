@@ -50,6 +50,14 @@ export PATH="$HOME/.local/bin:$PATH"
 codex-teams --help
 ```
 
+필요할 때만 의존성 자동 설치:
+
+```bash
+codex-teams deps --install
+```
+위 명령은 누락된 기본 의존성(`git`, `python3`, `wslpath`, `sqlite3`, `tmux`) 설치를 시도합니다.
+(`codex` CLI는 수동 설치 대상)
+
 ## 3. 5분 시작 (가장 쉬운 방법)
 
 예시 repo: `/mnt/c/Users/<you>/project`
@@ -99,6 +107,13 @@ codex-teams up --repo <repo> --session <session>
 
 ```bash
 codex-teams status --repo <repo> --session <session>
+```
+
+- 의존성 확인/자동 설치(필요할 때만):
+
+```bash
+codex-teams deps
+codex-teams deps --install
 ```
 
 - 워커 브랜치 통합(`ma/worker-1..3` -> 현재 브랜치):
@@ -156,6 +171,11 @@ TMUX_MAILBOX_POLL_MS="1500"
 # in-process 설정
 INPROCESS_POLL_MS="1000"
 INPROCESS_IDLE_MS="12000"
+INPROCESS_SHARED_STABILIZE_SEC="12"
+INPROCESS_SHARED_START_RETRIES="1"
+
+# 세션/레포 동시 실행 잠금 대기 시간
+SESSION_LOCK_WAIT_SEC="20"
 
 # 통합 전략: merge | cherry-pick
 MERGE_STRATEGY="merge"
@@ -208,6 +228,23 @@ ENABLE_TMUX_PULSE="false"
 TMUX_MAILBOX_POLL_MS="1500"
 INPROCESS_POLL_MS="1000"
 ```
+
+- in-process-shared 허브가 바로 종료될 때:
+  `status`와 허브 로그를 먼저 확인하세요.
+  ```bash
+  codex-teams status --repo <repo> --session <session>
+  tail -n 80 <repo>/.codex-teams/<session>/logs/inprocess-hub.log
+  tail -n 80 <repo>/.codex-teams/<session>/logs/inprocess-hub.lifecycle.log
+  ```
+
+- 같은 `<session>`에 대해 `up/run/teamdelete --force`를 병렬로 여러 터미널에서 동시에 실행하지 마세요.
+  최신 버전은 세션 잠금을 사용하지만, 의도치 않은 강제 종료 가능성을 줄이려면 직렬 실행이 안전합니다.
+
+- 이미 실행 중인 in-process 세션에서 다시 `up/run`을 호출하면 차단됩니다.
+  중복 허브/워커를 띄우지 않기 위한 보호 동작입니다.
+
+- 자동 설치가 실패할 때:
+  패키지 매니저 권한 문제일 수 있습니다. `sudo` 권한을 확인하거나 직접 설치 후 다시 `codex-teams deps --install`을 실행하세요.
 
 ## 9. 한 줄 예시 (Codex에서 스킬 호출)
 

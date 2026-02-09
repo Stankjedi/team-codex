@@ -27,6 +27,7 @@ import team_inprocess_agent as agent_loop  # noqa: E402
 
 
 STOP = False
+STOP_SIGNAL = ""
 
 
 @dataclass
@@ -42,8 +43,12 @@ class WorkerState:
 
 
 def on_signal(_signum: int, _frame: object) -> None:
-    global STOP
+    global STOP, STOP_SIGNAL
     STOP = True
+    try:
+        STOP_SIGNAL = signal.Signals(_signum).name
+    except Exception:
+        STOP_SIGNAL = str(_signum)
 
 
 def now_ms() -> int:
@@ -61,15 +66,49 @@ def role_from_agent_name(name: str, lead_name: str = "lead") -> str:
 
 
 def run_cmd(cmd: list[str], *, cwd: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return 127, f"failed to execute {' '.join(cmd)}: {exc}"
     return proc.returncode, proc.stdout or ""
+
+
+def utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def append_lifecycle(log_path: str, message: str) -> None:
+    if not log_path:
+        return
+    try:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{utc_now_iso()} {message}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        return
+
+
+def write_heartbeat(heartbeat_path: str, payload: dict[str, object]) -> None:
+    if not heartbeat_path:
+        return
+    try:
+        path = Path(heartbeat_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        return
 
 
 def fs_cmd(fs_path: Path, args: list[str]) -> tuple[int, str]:
@@ -231,6 +270,8 @@ def main() -> int:
     parser.add_argument("--idle-ms", type=int, default=12000)
     parser.add_argument("--permission-mode", default="default")
     parser.add_argument("--plan-mode-required", action="store_true")
+    parser.add_argument("--heartbeat-file", default="")
+    parser.add_argument("--lifecycle-log", default="")
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, on_signal)
@@ -239,6 +280,10 @@ def main() -> int:
     fs_path = SCRIPT_DIR / "team_fs.py"
     bus_path = SCRIPT_DIR / "team_bus.py"
     db_path = Path(args.repo).resolve() / ".codex-teams" / args.session / "bus.sqlite"
+    append_lifecycle(
+        args.lifecycle_log,
+        f"hub-start pid={os.getpid()} repo={Path(args.repo).resolve()} session={args.session} room={args.room}",
+    )
 
     paths = team_fs.resolve_paths(args.repo, args.session)
     cfg = team_fs.read_config(paths)
@@ -276,6 +321,23 @@ def main() -> int:
             profile = args.profile
             model = args.model
         if not Path(cwd).is_dir():
+            bus_cmd(
+                bus_path,
+                db_path,
+                [
+                    "send",
+                    "--room",
+                    args.room,
+                    "--from",
+                    "system",
+                    "--to",
+                    "all",
+                    "--kind",
+                    "status",
+                    "--body",
+                    f"skip worker bootstrap: missing worktree agent={name} cwd={cwd}",
+                ],
+            )
             continue
         wargs = argparse.Namespace(
             repo=args.repo,
@@ -302,11 +364,35 @@ def main() -> int:
         )
 
     if not workers:
-        return 0
+        append_lifecycle(args.lifecycle_log, "hub-abort no-worker-worktrees")
+        bus_cmd(
+            bus_path,
+            db_path,
+            [
+                "send",
+                "--room",
+                args.room,
+                "--from",
+                "system",
+                "--to",
+                "all",
+                "--kind",
+                "blocker",
+                "--body",
+                "in-process-shared hub aborted: no worker worktrees available",
+            ],
+        )
+        return 2
+
+    append_lifecycle(
+        args.lifecycle_log,
+        f"hub-workers-ready count={len(workers)} workers={','.join(w.args.agent for w in workers)}",
+    )
 
     for worker in workers:
         worker_online(bus_path, db_path, fs_path, worker)
 
+    last_heartbeat = 0
     while not STOP and any(not w.stopped for w in workers):
         for worker in workers:
             if STOP or worker.stopped:
@@ -448,6 +534,23 @@ def main() -> int:
                 )
                 worker.last_idle_sent = current
 
+        current_loop_ms = now_ms()
+        if current_loop_ms - last_heartbeat >= max(500, args.poll_ms):
+            active_workers = sum(1 for w in workers if not w.stopped)
+            write_heartbeat(
+                args.heartbeat_file,
+                {
+                    "ts": utc_now_iso(),
+                    "pid": os.getpid(),
+                    "session": args.session,
+                    "room": args.room,
+                    "active_workers": active_workers,
+                    "total_workers": len(workers),
+                    "stop": STOP,
+                },
+            )
+            last_heartbeat = current_loop_ms
+
         time.sleep(max(0.1, args.poll_ms / 1000.0))
 
     for worker in workers:
@@ -455,6 +558,13 @@ def main() -> int:
             worker_offline(bus_path, db_path, fs_path, worker)
             worker.stopped = True
 
+    stop_reason = "all-workers-stopped"
+    if STOP:
+        stop_reason = f"signal:{STOP_SIGNAL or 'unknown'}"
+    append_lifecycle(
+        args.lifecycle_log,
+        f"hub-stop reason={stop_reason} active_workers={sum(1 for w in workers if not w.stopped)}",
+    )
     return 0
 
 
