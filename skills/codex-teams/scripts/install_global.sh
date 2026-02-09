@@ -100,13 +100,6 @@ exec "$TARGET_DIR/scripts/team_codex.sh" "\$@"
 EOF
   chmod +x "$BIN_DIR/codex-teams"
 
-  cat > "$BIN_DIR/codex-teams-ma" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$TARGET_DIR/scripts/team_codex_ma.sh" "\$@"
-EOF
-  chmod +x "$BIN_DIR/codex-teams-ma"
-
   cat > "$BIN_DIR/codex-teams-dashboard" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -143,9 +136,12 @@ EOF
   chmod +x "$BIN_DIR/codex-teams-fs"
 fi
 
-# Cleanup legacy launcher from older versions.
+# Cleanup legacy launchers from older versions.
 if [[ -f "$BIN_DIR/codex-teams-run" ]]; then
   rm -f "$BIN_DIR/codex-teams-run"
+fi
+if [[ -f "$BIN_DIR/codex-teams-ma" ]]; then
+  rm -f "$BIN_DIR/codex-teams-ma"
 fi
 
 cat <<EOF
@@ -154,7 +150,6 @@ Installed skill:
 
 Launchers:
 - $BIN_DIR/codex-teams
-- $BIN_DIR/codex-teams-ma
 - $BIN_DIR/codex-teams-dashboard
 - $BIN_DIR/codex-teams-mailbox
 - $BIN_DIR/codex-teams-control
@@ -162,8 +157,7 @@ Launchers:
 - $BIN_DIR/codex-teams-fs
 
 Next:
-- codex-teams teamcreate --session codex-fleet --workers 4
+- codex-teams teamcreate --session codex-fleet --workers 3
 - codex-teams run --task "<task>" --session codex-fleet
 - (optional) codex-teams run --task "<task>" --workers 3
-- (legacy alias) codex-teams-ma run --task "<task>"
 EOF

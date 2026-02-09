@@ -14,6 +14,7 @@ Codex CLI + tmux/in-process + SQLite bus + filesystem mailbox 기반 멀티 에�
 
 - 기본 실행 형태: `lead(external) + worker-1 + worker-2 + worker-3` 협업 토폴로지
 - 기본 백엔드: `in-process-shared` (옵션 미지정 시)
+- 독립 실행: `codex-ma` 브리지 없이 `codex-teams` 단독 스크립트로 동작
 - 금지: 스킬 호출 후 단일 에이전트 단독 구현으로 대체하는 것
 - 예외: 런타임/환경 제약으로 멀티에이전트 실행이 불가능한 경우에만, blocker와 필요한 입력/조치 사항을 즉시 보고
 
@@ -161,7 +162,6 @@ Model precedence (highest first):
 ## Scripts
 
 - `scripts/team_codex.sh`: main entrypoint (`setup/run/up/status/merge/teamcreate/teamdelete/sendmessage`)
-- `scripts/team_codex_ma.sh`: legacy codex-ma backend bridge
 - `scripts/team_bus.py`: SQLite bus (`init`, `send`, `tail`, `status`, mailbox/control)
 - `scripts/team_fs.py`: filesystem team config/mailbox/state/runtime core
 - `scripts/team_mailbox.sh`: unread mailbox + pending control requests
@@ -185,11 +185,4 @@ tmux attach -t <session>
 - Or open unified dashboard:
 ```bash
 codex-teams-dashboard --session <session> --repo <repo> --room main
-```
-
-## Legacy Backend
-
-If you need previous codex-ma flow:
-```bash
-codex-teams-ma run --task "<task>"
 ```

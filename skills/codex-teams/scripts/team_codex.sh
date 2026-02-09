@@ -14,7 +14,6 @@ TAIL_SCRIPT="$SCRIPT_DIR/team_tail.sh"
 INPROCESS_AGENT="$SCRIPT_DIR/team_inprocess_agent.py"
 INPROCESS_HUB="$SCRIPT_DIR/team_inprocess_hub.py"
 TMUX_MAILBOX_BRIDGE="$SCRIPT_DIR/team_tmux_mailbox_bridge.py"
-LEGACY_SCRIPT="$SCRIPT_DIR/team_codex_ma.sh"
 VIEWER_BRIDGE_FILE=".codex-teams/.viewer-session.json"
 WINDOWS_GIT_EXE_PATH="/mnt/c/Program Files/Git/cmd/git.exe"
 
@@ -83,6 +82,7 @@ WORKER_COUNT="3"
 TEAM_ROLE_SUMMARY=""
 NORMALIZED_TEAMMATE_MODE=""
 LEAD_WORKTREE=""
+INPROCESS_HUB_AGENT="inprocess-hub"
 
 declare -a TEAM_AGENT_NAMES=()
 declare -A TEAM_AGENT_ROLE=()
@@ -98,12 +98,12 @@ Usage:
   team_codex.sh <command> [options]
 
 Commands:
-  init                    Initialize codex-ma compatible project config
+  init                    Initialize project config for codex-teams
   setup                   Prepare repository (git init + initial commit) for codex-teams
   run                     TeamCreate + spawn teammates + inject task
   up                      Same as run without task injection
   status                  Show runtime/team/bus/tmux status
-  merge                   Merge worker branches (delegates to codex-ma backend)
+  merge                   Merge worker branches into current branch
   teamcreate              Create team config/inboxes/state
   teamdelete              Delete team artifacts
   sendmessage             Send typed team message (Claude Teams-style union)
@@ -148,13 +148,13 @@ run/up options:
   --dashboard-messages N  Dashboard recent message count
   --no-attach             Do not attach tmux session after launch
 
-teamcreate/teamdelete options:
+init/teamcreate/teamdelete options:
   --team-name NAME        Team name override (default: session)
   --description TEXT      Team description
   --lead-name NAME        Team lead name (default: lead)
   --agent-type TYPE       Team lead agent type (default: team-lead)
+  --force                 Overwrite existing config on init / force delete on teamdelete
   --replace               Overwrite existing team config on teamcreate
-  --force                 Force delete even with active members/session
 
 sendmessage options:
   --type TYPE             message|broadcast|shutdown_request|shutdown_response|shutdown_approved|shutdown_rejected|plan_approval_request|plan_approval_response|permission_request|permission_response|mode_set_request|mode_set_response
@@ -736,6 +736,7 @@ load_config_or_defaults() {
   case "$KILL_EXISTING_SESSION" in true|false) ;; *) abort "KILL_EXISTING_SESSION must be true/false" ;; esac
   case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "TEAMMATE_MODE must be auto|tmux|in-process|in-process-shared" ;; esac
   case "$TMUX_LAYOUT" in split|window) ;; *) abort "TMUX_LAYOUT must be split|window" ;; esac
+  case "$MERGE_STRATEGY" in merge|cherry-pick) ;; *) abort "MERGE_STRATEGY must be merge|cherry-pick" ;; esac
   case "$PLAN_MODE_REQUIRED" in true|false) ;; *) abort "PLAN_MODE_REQUIRED must be true|false" ;; esac
   case "$AUTO_DELEGATE" in true|false) ;; *) abort "AUTO_DELEGATE must be true|false" ;; esac
   case "$AUTO_KILL_DONE_WORKER_TMUX" in true|false) ;; *) abort "AUTO_KILL_DONE_WORKER_TMUX must be true|false" ;; esac
@@ -1304,6 +1305,8 @@ spawn_inprocess_shared_backend() {
   nohup "${args[@]}" >"$hub_log" 2>&1 &
   local pid=$!
 
+  fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$INPROCESS_HUB_AGENT" \
+    --backend in-process-shared --status running --pid "$pid" --window in-process-shared >/dev/null
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
     --body "spawned in-process shared hub pid=$pid members=$hub_count roles=[$TEAM_ROLE_SUMMARY] log=$hub_log" >/dev/null
 }
@@ -1754,15 +1757,61 @@ agents = runtime.get("agents", {})
 if not isinstance(agents, dict):
     raise SystemExit(0)
 for name, record in agents.items():
-    if isinstance(record, dict) and str(record.get("status", "")) == "running":
-        print(str(name))
+    if not isinstance(record, dict):
+        continue
+    if str(record.get("status", "")) != "running":
+        continue
+    pid = int(record.get("pid", 0) or 0)
+    print(f"{name}|{pid}")
 PY
 )"
+
+  local line
   local agent
-  while IFS= read -r agent; do
-    [[ -z "$agent" ]] && continue
+  local pid
+  declare -A runtime_pids=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    agent="${line%%|*}"
+    pid="${line##*|}"
+    if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]]; then
+      runtime_pids["$pid"]=1
+    fi
     fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --signal term >/dev/null 2>&1 || true
   done <<< "$running_agents"
+
+  if [[ "${#runtime_pids[@]}" -gt 0 ]]; then
+    local deadline=$((SECONDS + 6))
+    local any_alive
+    while (( SECONDS <= deadline )); do
+      any_alive=0
+      for pid in "${!runtime_pids[@]}"; do
+        if kill -0 "$pid" >/dev/null 2>&1; then
+          any_alive=1
+          break
+        fi
+      done
+      if [[ "$any_alive" -eq 0 ]]; then
+        break
+      fi
+      sleep 0.2
+    done
+
+    for pid in "${!runtime_pids[@]}"; do
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+
+  # Backward-compatible fallback: older sessions may not have tracked hub runtime.
+  if command -v pgrep >/dev/null 2>&1; then
+    local hub_pid
+    while IFS= read -r hub_pid; do
+      [[ -z "$hub_pid" ]] && continue
+      kill "$hub_pid" >/dev/null 2>&1 || true
+    done < <(pgrep -f "team_inprocess_hub.py.*--repo $REPO.*--session $TMUX_SESSION" || true)
+  fi
 }
 
 cmd_teamcreate() {
@@ -1895,6 +1944,111 @@ EOF
   echo "- git: $git_bin"
   echo "- head: $head"
   echo "- config: $REPO/.codex-multi-agent.config.sh"
+}
+
+cmd_init() {
+  local config_path="$REPO/.codex-multi-agent.config.sh"
+  if [[ -f "$config_path" ]]; then
+    if [[ "$DELETE_FORCE" != "true" ]]; then
+      echo "Config already exists: $config_path"
+      echo "Use --force to overwrite."
+      exit 2
+    fi
+    rm -f "$config_path"
+  fi
+
+  ensure_default_project_config "$config_path"
+  echo "Initialized team config at: $config_path"
+}
+
+merge_worker_branch() {
+  local branch="$1"
+  local ahead="$2"
+
+  if [[ "$MERGE_STRATEGY" == "merge" ]]; then
+    echo "merge branch: $branch (ahead=$ahead)"
+    if ! git_repo_cmd "$REPO" merge --no-ff --no-edit "$branch"; then
+      return 1
+    fi
+    return 0
+  fi
+
+  local commits=()
+  mapfile -t commits < <(git_repo_cmd "$REPO" rev-list --reverse "HEAD..$branch")
+  if [[ "${#commits[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  echo "cherry-pick branch: $branch (commits=${#commits[@]})"
+  if ! git_repo_cmd "$REPO" cherry-pick "${commits[@]}"; then
+    return 1
+  fi
+  return 0
+}
+
+cmd_merge() {
+  load_config_or_defaults
+  require_cmd "$GIT_BIN"
+  require_repo_ready_for_run
+
+  local current_branch
+  current_branch="$(git_repo_cmd "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "$current_branch" || "$current_branch" == "HEAD" ]]; then
+    abort "merge requires a checked-out branch (detached HEAD is not supported)"
+  fi
+
+  if [[ -n "$(git_repo_cmd "$REPO" status --porcelain=v1 --untracked-files=no)" ]]; then
+    abort "working tree has uncommitted changes. commit/stash before merge"
+  fi
+
+  local merged_count=0
+  local skipped_count=0
+  local attempted_count=0
+  local agent
+  for agent in "${TEAM_AGENT_NAMES[@]}"; do
+    local branch="ma/$agent"
+    if ! git_repo_cmd "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+      echo "skip missing branch: $branch"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    local ahead
+    ahead="$(git_repo_cmd "$REPO" rev-list --count "HEAD..$branch" 2>/dev/null || echo 0)"
+    if ! [[ "$ahead" =~ ^[0-9]+$ ]]; then
+      ahead="0"
+    fi
+    if [[ "$ahead" == "0" ]]; then
+      echo "skip no new commits: $branch"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    attempted_count=$((attempted_count + 1))
+    if ! merge_worker_branch "$branch" "$ahead"; then
+      if [[ "$MERGE_STRATEGY" == "merge" ]]; then
+        abort "merge failed for $branch. resolve conflicts manually, then retry."
+      fi
+      abort "cherry-pick failed for $branch. resolve conflicts with git cherry-pick --continue/--abort."
+    fi
+    merged_count=$((merged_count + 1))
+
+    if [[ -f "$DB" ]]; then
+      python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
+        --body "merge-applied strategy=$MERGE_STRATEGY branch=$branch ahead=$ahead" >/dev/null || true
+    fi
+  done
+
+  echo "merge complete"
+  echo "- repo: $REPO"
+  echo "- strategy: $MERGE_STRATEGY"
+  echo "- merged branches: $merged_count"
+  echo "- skipped branches: $skipped_count"
+  echo "- attempted branches: $attempted_count"
+
+  if [[ -f "$DB" ]]; then
+    python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status \
+      --body "merge completed strategy=$MERGE_STRATEGY merged=$merged_count skipped=$skipped_count attempted=$attempted_count" >/dev/null || true
+  fi
 }
 
 cmd_teamdelete() {
@@ -2458,7 +2612,7 @@ main() {
 
   case "$COMMAND" in
     init)
-      exec "$LEGACY_SCRIPT" init --repo "$REPO"
+      cmd_init
       ;;
 
     setup)
@@ -2466,7 +2620,7 @@ main() {
       ;;
 
     merge)
-      exec "$LEGACY_SCRIPT" merge --repo "$REPO" --config "$CONFIG" --room "$ROOM"
+      cmd_merge
       ;;
 
     teamcreate)
