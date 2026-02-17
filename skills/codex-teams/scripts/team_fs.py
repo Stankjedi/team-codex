@@ -395,7 +395,8 @@ def mailbox_read_indexed(
                 continue
             values.append((idx, deep_copy(msg)))
         if limit > 0:
-            values = values[-limit:]
+            # Oldest-first selection prevents starvation when unread backlog grows.
+            values = values[:limit]
 
         selected_indexes = {idx for idx, _ in values}
         if selected_indexes:
@@ -661,12 +662,39 @@ def runtime_prune(runtime: dict[str, Any]) -> int:
     if not isinstance(agents, dict):
         runtime["agents"] = {}
         return 0
+
+    shared_hub_alive = False
+    shared_hub_record_found = False
+    hub_rec = agents.get("inprocess-hub")
+    if isinstance(hub_rec, dict) and str(hub_rec.get("backend", "")) == "in-process-shared":
+        shared_hub_record_found = True
+        hub_status = str(hub_rec.get("status", ""))
+        hub_pid = int(hub_rec.get("pid", 0) or 0)
+        if hub_status == "running":
+            if hub_pid > 0 and is_pid_alive(hub_pid):
+                shared_hub_alive = True
+            else:
+                hub_rec["status"] = "terminated"
+                hub_rec["updatedAt"] = now_ms()
+                agents["inprocess-hub"] = hub_rec
+                changed += 1
+
     for name, rec in list(agents.items()):
         if not isinstance(rec, dict):
             continue
         pid = int(rec.get("pid", 0) or 0)
         status = str(rec.get("status", ""))
         if status == "running" and pid > 0 and not is_pid_alive(pid):
+            rec["status"] = "terminated"
+            rec["updatedAt"] = now_ms()
+            changed += 1
+        elif (
+            status == "running"
+            and str(rec.get("backend", "")) == "in-process-shared"
+            and name != "inprocess-hub"
+            and shared_hub_record_found
+            and not shared_hub_alive
+        ):
             rec["status"] = "terminated"
             rec["updatedAt"] = now_ms()
             changed += 1

@@ -34,6 +34,8 @@ DONE_NEGATIVE_MARKERS = {"not done", "in progress", "wip", "todo", "incomplete"}
 MAX_CAPTURE_BYTES = 200_000
 MAX_DRAIN_BYTES_PER_TICK = 64_000
 MAX_DRAIN_CHUNKS_PER_TICK = 16
+WORKER_MAILBOX_BATCH = 200
+LEAD_DONE_SCAN_BATCH = 500
 
 
 @dataclass
@@ -159,23 +161,30 @@ def load_unread_messages(paths: team_fs.FsPaths, worker: WorkerState, *, limit: 
     return rows
 
 
-def load_unread_messages_no_mark(paths: team_fs.FsPaths, agent: str, *, limit: int) -> list[dict]:
+def load_unread_messages_no_mark(
+    paths: team_fs.FsPaths,
+    agent: str,
+    *,
+    limit: int,
+    skip_indexes: set[int] | None = None,
+) -> list[dict]:
+    skip = skip_indexes or set()
     try:
-        values = team_fs.mailbox_read_indexed(
-            paths,
-            agent,
-            unread=True,
-            limit=limit,
-            mark_read_selected=False,
-        )
+        mailbox = team_fs.read_mailbox(paths, agent)
     except Exception:
         return []
 
     rows: list[dict] = []
-    for idx, row in values:
+    for idx, row in enumerate(mailbox):
+        if idx in skip:
+            continue
         if not isinstance(row, dict):
             continue
+        if bool(row.get("read", False)):
+            continue
         rows.append({"index": idx, **row})
+        if limit > 0 and len(rows) >= limit:
+            break
     return rows
 
 
@@ -653,6 +662,26 @@ def main() -> int:
 
     for worker in workers:
         worker_online(bus_path, db_path, fs_path, worker)
+    fs_cmd(
+        fs_path,
+        [
+            "runtime-set",
+            "--repo",
+            args.repo,
+            "--session",
+            args.session,
+            "--agent",
+            "inprocess-hub",
+            "--backend",
+            "in-process-shared",
+            "--status",
+            "running",
+            "--pid",
+            str(os.getpid()),
+            "--window",
+            "in-process-shared",
+        ],
+    )
 
     worker_done: dict[str, bool] = {
         worker.args.agent: False for worker in workers if worker.args.role == "worker"
@@ -660,6 +689,7 @@ def main() -> int:
     review_ready_announced = False
     lead_last_mention_token = 0
     lead_seen_indexes: set[int] = set()
+    force_lead_scan = False
     last_heartbeat = 0
     while not STOP and any(not w.stopped for w in workers):
         for worker in workers:
@@ -670,9 +700,11 @@ def main() -> int:
             should_check_mailbox = worker.force_mailbox_check or mention_token != worker.last_mention_token
             unread: list[dict] = []
             if should_check_mailbox:
-                unread = load_unread_messages(paths, worker, limit=200)
+                unread = load_unread_messages(paths, worker, limit=WORKER_MAILBOX_BATCH)
                 worker.force_mailbox_check = False
                 worker.last_mention_token = mention_token
+                if len(unread) >= WORKER_MAILBOX_BATCH:
+                    worker.force_mailbox_check = True
             if unread:
                 messages: list[dict] = []
                 for item in unread:
@@ -791,8 +823,14 @@ def main() -> int:
                 worker.last_idle_sent = current
 
         lead_mention_token = team_fs.mailbox_signal_token(paths, lead)
-        if lead_mention_token != lead_last_mention_token:
-            lead_rows = load_unread_messages_no_mark(paths, lead, limit=500)
+        should_scan_lead = force_lead_scan or lead_mention_token != lead_last_mention_token
+        if should_scan_lead:
+            lead_rows = load_unread_messages_no_mark(
+                paths,
+                lead,
+                limit=LEAD_DONE_SCAN_BATCH,
+                skip_indexes=lead_seen_indexes,
+            )
             for row in lead_rows:
                 idx = row.get("index")
                 if not isinstance(idx, int) or idx < 0:
@@ -811,7 +849,9 @@ def main() -> int:
                     worker_done[sender] = False
                     review_ready_announced = False
             trim_seen_indexes(lead_seen_indexes)
-            lead_last_mention_token = lead_mention_token
+            force_lead_scan = bool(LEAD_DONE_SCAN_BATCH > 0 and len(lead_rows) >= LEAD_DONE_SCAN_BATCH)
+            if not force_lead_scan:
+                lead_last_mention_token = lead_mention_token
 
         if not review_ready_announced and all_workers_review_ready(workers, worker_done):
             notify_review_ready(
@@ -858,6 +898,20 @@ def main() -> int:
     append_lifecycle(
         args.lifecycle_log,
         f"hub-stop reason={stop_reason} active_workers={sum(1 for w in workers if not w.stopped)}",
+    )
+    fs_cmd(
+        fs_path,
+        [
+            "runtime-mark",
+            "--repo",
+            args.repo,
+            "--session",
+            args.session,
+            "--agent",
+            "inprocess-hub",
+            "--status",
+            "terminated",
+        ],
     )
     return 0
 

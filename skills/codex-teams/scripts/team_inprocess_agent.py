@@ -402,6 +402,8 @@ def handle_control_messages(
 
             if requester not in known_members:
                 response_text = f"unauthorized shutdown_request sender={requester or '<unknown>'}"
+            elif requester != lead:
+                response_text = f"shutdown_request allowed only from lead={lead}; got={requester or '<unknown>'}"
             elif has_control_req:
                 validation_error = validate_control_request_record(
                     control_req,
@@ -507,6 +509,8 @@ def handle_control_messages(
 
             if requester not in known_members:
                 response_text = f"unauthorized mode_set_request sender={requester or '<unknown>'}"
+            elif requester != lead:
+                response_text = f"mode_set_request allowed only from lead={lead}; got={requester or '<unknown>'}"
             elif not requested_mode:
                 response_text = "missing mode in mode_set_request"
             elif requested_mode not in PERMISSION_MODES:
