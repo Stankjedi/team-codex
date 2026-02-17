@@ -32,6 +32,8 @@ STOP_SIGNAL = ""
 DONE_KEYWORDS = {"done", "complete", "completed", "finish", "finished", "resolved", "fixed"}
 DONE_NEGATIVE_MARKERS = {"not done", "in progress", "wip", "todo", "incomplete"}
 MAX_CAPTURE_BYTES = 200_000
+MAX_DRAIN_BYTES_PER_TICK = 64_000
+MAX_DRAIN_CHUNKS_PER_TICK = 16
 
 
 @dataclass
@@ -301,7 +303,7 @@ def worker_online(bus_path: Path, db_path: Path, fs_path: Path, worker: WorkerSt
             "--status",
             "running",
             "--pid",
-            str(os.getpid()),
+            "0",
             "--window",
             "in-process-shared",
         ],
@@ -325,7 +327,10 @@ def worker_online(bus_path: Path, db_path: Path, fs_path: Path, worker: WorkerSt
             "--kind",
             "status",
             "--body",
-            f"online backend=in-process-shared pid={os.getpid()} permission_mode={worker.args.permission_mode}",
+            (
+                "online backend=in-process-shared pid=0 "
+                f"hub_pid={os.getpid()} permission_mode={worker.args.permission_mode}"
+            ),
         ],
     )
 
@@ -440,12 +445,19 @@ def reset_worker_output_capture(worker: WorkerState) -> None:
     worker.active_output_truncated = False
 
 
-def drain_worker_output(worker: WorkerState) -> None:
+def drain_worker_output(worker: WorkerState, *, drain_all: bool = False) -> None:
     proc = worker.active_proc
     if proc is None or proc.stdout is None:
         return
     fd = proc.stdout.fileno()
+    drained_bytes = 0
+    drained_chunks = 0
     while True:
+        if not drain_all:
+            if drained_bytes >= MAX_DRAIN_BYTES_PER_TICK:
+                break
+            if drained_chunks >= MAX_DRAIN_CHUNKS_PER_TICK:
+                break
         try:
             chunk = os.read(fd, 8192)
         except BlockingIOError:
@@ -454,6 +466,8 @@ def drain_worker_output(worker: WorkerState) -> None:
             break
         if not chunk:
             break
+        drained_bytes += len(chunk)
+        drained_chunks += 1
         if worker.active_output_bytes >= MAX_CAPTURE_BYTES:
             worker.active_output_truncated = True
             continue
@@ -490,7 +504,7 @@ def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None
                 proc.kill()
             except Exception:
                 pass
-    drain_worker_output(worker)
+    drain_worker_output(worker, drain_all=True)
     worker.active_proc = None
     worker.active_started_ms = 0
     reset_worker_output_capture(worker)
@@ -723,6 +737,7 @@ def main() -> int:
                 drain_worker_output(worker)
                 exit_code = worker.active_proc.poll()
                 if exit_code is not None:
+                    drain_worker_output(worker, drain_all=True)
                     run_out = collected_worker_output(worker)
                     worker.active_proc = None
                     worker.active_started_ms = 0

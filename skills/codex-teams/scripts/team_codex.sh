@@ -2245,8 +2245,15 @@ apply_shutdown_target() {
       tmux kill-window -t "$TMUX_SESSION:$window" >/dev/null 2>&1 || true
     fi
     fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
-  elif [[ "$backend" == "in-process" || "$backend" == "in-process-shared" ]]; then
+  elif [[ "$backend" == "in-process" ]]; then
     fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --signal term >/dev/null || true
+  elif [[ "$backend" == "in-process-shared" ]]; then
+    if [[ "$target" == "$INPROCESS_HUB_AGENT" ]]; then
+      fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --signal term >/dev/null || true
+    else
+      fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type shutdown_request --from "$TEAM_LEAD_NAME" --recipient "$target" \
+        --summary "shutdown-request" --content "shutdown approved; terminate teammate loop" >/dev/null || true
+    fi
   elif [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
     kill "$pid" >/dev/null 2>&1 || true
     fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
@@ -2849,7 +2856,7 @@ PY
         local fs_req_info
         fs_req_info="$(fs_lookup_request_fields "$rid" || true)"
         if [[ "$fs_req_info" == "||" || -z "$fs_req_info" ]]; then
-          fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type "$msg_type" --from "$MESSAGE_SENDER" --recipient "$recipient" --content "$body" --summary "$summary" --request-id "$rid" --meta "$MESSAGE_META" >/dev/null
+          abort "control request persistence failed for request_id=$rid type=$req_type; refusing orphan request dispatch"
         fi
       fi
       echo "request_id=$rid"
@@ -2879,6 +2886,9 @@ PY
       if [[ "$req_info" == "||" || -z "$req_info" ]]; then
         req_info="$(fs_lookup_request_fields "$MESSAGE_REQUEST_ID" || true)"
       fi
+      if [[ "$req_info" == "||" || -z "$req_info" ]]; then
+        abort "control response requires existing request_id=$MESSAGE_REQUEST_ID"
+      fi
       req_type="${req_info%%|*}"
       local req_tail="${req_info#*|}"
       req_sender="${req_tail%%|*}"
@@ -2897,8 +2907,9 @@ PY
         response_req_type="$msg_type"
         response_req_type="${response_req_type%_response}"
       fi
-      fs_control_respond "$MESSAGE_REQUEST_ID" "$MESSAGE_SENDER" "$MESSAGE_APPROVE" "$response_body" "$recipient" "$response_req_type" || \
-        fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type "$msg_type" --from "$MESSAGE_SENDER" --recipient "$recipient" --content "$response_body" --summary "$summary" --request-id "$MESSAGE_REQUEST_ID" --approve "$MESSAGE_APPROVE" --meta "$MESSAGE_META" >/dev/null
+      if ! fs_control_respond "$MESSAGE_REQUEST_ID" "$MESSAGE_SENDER" "$MESSAGE_APPROVE" "$response_body" "$recipient" "$response_req_type"; then
+        abort "control response persistence failed request_id=$MESSAGE_REQUEST_ID type=$response_req_type"
+      fi
 
       if [[ "$msg_type" == "shutdown_response" && "$MESSAGE_APPROVE" == "true" ]]; then
         local shutdown_target="$req_target"

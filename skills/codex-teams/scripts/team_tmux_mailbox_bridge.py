@@ -34,6 +34,8 @@ NON_ACTIONABLE_PROMPT_TYPES = {
     "shutdown_rejected",
     "mode_set_response",
 }
+DONE_TOKENS = {"done", "complete", "completed", "finish", "finished", "resolved", "fixed"}
+DONE_NEGATIVE_MARKERS = {"not done", "in progress", "wip", "todo", "incomplete"}
 
 
 def run_cmd(cmd: list[str]) -> tuple[int, str]:
@@ -115,13 +117,15 @@ def summary_indicates_done(summary: str) -> bool:
     text = str(summary or "").strip().lower()
     if not text:
         return False
+    for marker in DONE_NEGATIVE_MARKERS:
+        if marker in text:
+            return False
     tokens = [tok for tok in re.split(r"[^a-z0-9]+", text) if tok]
     if not tokens:
         return False
-    done_tokens = {"done", "complete", "completed", "finish", "finished"}
-    if "not" in tokens and any(tok in done_tokens for tok in tokens):
+    if "not" in tokens and any(tok in DONE_TOKENS for tok in tokens):
         return False
-    return any(tok in done_tokens for tok in tokens)
+    return any(tok in DONE_TOKENS for tok in tokens)
 
 
 def should_inject_prompt_for_message(message: dict) -> bool:

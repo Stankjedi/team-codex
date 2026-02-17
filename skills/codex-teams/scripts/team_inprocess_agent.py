@@ -169,6 +169,28 @@ def load_control_request(repo: str, session: str, request_id: str, db_path: Path
     }
 
 
+def validate_control_request_record(
+    control_req: dict,
+    *,
+    expected_type: str,
+    requester: str,
+    recipient: str,
+) -> str:
+    req_type = str(control_req.get("req_type", "")).strip()
+    req_status = str(control_req.get("status", "")).strip()
+    req_sender = str(control_req.get("sender", "")).strip()
+    req_recipient = str(control_req.get("recipient", "")).strip()
+    if req_type != expected_type:
+        return f"request type mismatch: expected {expected_type} got={req_type or 'unknown'}"
+    if req_status != "pending":
+        return f"request already resolved: status={req_status or 'unknown'}"
+    if req_sender and requester and req_sender != requester:
+        return f"request sender mismatch: expected={req_sender} got={requester}"
+    if req_recipient and req_recipient != recipient:
+        return f"request recipient mismatch: expected={req_recipient} got={recipient}"
+    return ""
+
+
 def load_unread_messages(paths: team_fs.FsPaths, agent: str, *, limit: int) -> list[dict]:
     try:
         values = team_fs.mailbox_read_indexed(
@@ -372,8 +394,33 @@ def handle_control_messages(
         meta = parse_meta(msg.get("meta"))
 
         if mtype == "shutdown_request":
-            response_text = "shutdown approved"
-            if request_id:
+            requester = sender.strip()
+            response_text = ""
+            approved = False
+            control_req = load_control_request(args.repo, args.session, request_id, db_path) if request_id else {}
+            has_control_req = bool(control_req)
+
+            if requester not in known_members:
+                response_text = f"unauthorized shutdown_request sender={requester or '<unknown>'}"
+            elif has_control_req:
+                validation_error = validate_control_request_record(
+                    control_req,
+                    expected_type="shutdown",
+                    requester=requester,
+                    recipient=args.agent,
+                )
+                if validation_error:
+                    response_text = validation_error
+                else:
+                    approved = True
+                    response_text = "shutdown approved"
+            elif request_id:
+                response_text = f"request not found: request_id={request_id}"
+            else:
+                approved = True
+                response_text = "shutdown approved (compatibility: no request_id)"
+
+            if request_id and has_control_req:
                 bus_cmd(
                     bus_path,
                     db_path,
@@ -383,7 +430,7 @@ def handle_control_messages(
                         request_id,
                         "--from",
                         args.agent,
-                        "--approve",
+                        "--approve" if approved else "--reject",
                         "--body",
                         response_text,
                     ],
@@ -393,7 +440,7 @@ def handle_control_messages(
                     args=args,
                     request_id=request_id,
                     responder=args.agent,
-                    approve=True,
+                    approve=approved,
                     body=response_text,
                     recipient=sender or lead,
                     req_type="shutdown",
@@ -407,8 +454,9 @@ def handle_control_messages(
                     sender=args.agent,
                     recipient=sender or lead,
                     content=response_text,
+                    summary=summary,
                     request_id=request_id,
-                    approve=True,
+                    approve=approved,
                 )
             bus_cmd(
                 bus_path,
@@ -424,10 +472,28 @@ def handle_control_messages(
                     "--kind",
                     "status",
                     "--body",
-                    "shutdown requested; terminating agent loop",
+                    f"shutdown handled approved={str(approved).lower()}",
                 ],
             )
-            should_shutdown = True
+            if approved:
+                bus_cmd(
+                    bus_path,
+                    db_path,
+                    [
+                        "send",
+                        "--room",
+                        args.room,
+                        "--from",
+                        args.agent,
+                        "--to",
+                        "all",
+                        "--kind",
+                        "status",
+                        "--body",
+                        "shutdown requested; terminating agent loop",
+                    ],
+                )
+                should_shutdown = True
             continue
 
         if mtype == "mode_set_request":
@@ -446,29 +512,24 @@ def handle_control_messages(
             elif requested_mode not in PERMISSION_MODES:
                 response_text = f"unsupported mode={requested_mode}"
             elif has_control_req:
-                req_type = str(control_req.get("req_type", "")).strip()
-                req_status = str(control_req.get("status", "")).strip()
-                req_sender = str(control_req.get("sender", "")).strip()
-                req_recipient = str(control_req.get("recipient", "")).strip()
-                if req_type != "mode_set":
-                    response_text = f"request type mismatch: expected mode_set got={req_type or 'unknown'}"
-                elif req_status != "pending":
-                    response_text = f"request already resolved: status={req_status or 'unknown'}"
-                elif req_sender and requester and req_sender != requester:
-                    response_text = f"request sender mismatch: expected={req_sender} got={requester}"
-                elif req_recipient and req_recipient != args.agent:
-                    response_text = f"request recipient mismatch: expected={req_recipient} got={args.agent}"
+                validation_error = validate_control_request_record(
+                    control_req,
+                    expected_type="mode_set",
+                    requester=requester,
+                    recipient=args.agent,
+                )
+                if validation_error:
+                    response_text = validation_error
                 else:
                     approved = True
                     response_text = "mode updated"
+            elif request_id:
+                response_text = f"request not found: request_id={request_id}"
             else:
                 # Compatibility path: allow direct mode_set request from known teammates
-                # even when no control request record exists.
+                # only when no request-id is provided.
                 approved = True
-                if request_id:
-                    response_text = f"mode updated (compatibility: request_id_not_found={request_id})"
-                else:
-                    response_text = "mode updated (compatibility: no request_id)"
+                response_text = "mode updated (compatibility: no request_id)"
 
             if approved:
                 args.permission_mode = requested_mode

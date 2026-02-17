@@ -879,7 +879,11 @@ def deliver_message(
 
     all_names = [str(m.get("name", "")) for m in members(cfg) if m.get("name")]
     targets: list[str]
-    if msg_type == "broadcast":
+    is_control_type = msg_type.endswith("_request") or msg_type.endswith("_response") or msg_type in {
+        "shutdown_approved",
+        "shutdown_rejected",
+    }
+    if msg_type == "broadcast" or (recipient == "all" and not is_control_type):
         targets = [n for n in all_names if n != sender]
     else:
         if not recipient:
@@ -1414,6 +1418,34 @@ def cmd_runtime_kill(args: argparse.Namespace) -> int:
     rec = agents.get(args.agent)
     if not isinstance(rec, dict):
         raise SystemExit(f"runtime agent not found: {args.agent}")
+    backend = str(rec.get("backend", "")).strip()
+    if backend == "in-process-shared" and args.agent != "inprocess-hub":
+        # Shared workers are logical members inside the hub process; killing their
+        # recorded pid can terminate the whole hub in legacy sessions.
+        try:
+            cfg = read_config(p)
+            sender = lead_name(cfg)
+            deliver_message(
+                p,
+                cfg,
+                msg_type="shutdown_request",
+                sender=sender,
+                recipient=args.agent,
+                content="runtime-kill requested; terminate teammate loop",
+                summary="runtime-kill-shared-worker",
+                request_id="",
+                approve=None,
+                meta={"source": "runtime-kill", "backend": "in-process-shared"},
+            )
+            rec["status"] = "stopping"
+        except Exception:
+            rec["status"] = "terminated"
+        rec["updatedAt"] = now_ms()
+        agents[args.agent] = rec
+        rt["agents"] = agents
+        write_runtime(p, rt)
+        print(json.dumps(rec, ensure_ascii=False))
+        return 0
     pid = int(rec.get("pid", 0) or 0)
     if pid > 0 and is_pid_alive(pid):
         sig = signal.SIGTERM if args.signal == "term" else signal.SIGKILL
