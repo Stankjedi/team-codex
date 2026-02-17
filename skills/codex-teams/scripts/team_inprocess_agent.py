@@ -39,6 +39,7 @@ NON_ACTIONABLE_WORK_TYPES = {
     "shutdown_rejected",
     "mode_set_response",
 }
+WORKER_MAILBOX_BATCH = 200
 
 
 def on_signal(signum: int, _frame: object) -> None:
@@ -175,6 +176,7 @@ def validate_control_request_record(
     expected_type: str,
     requester: str,
     recipient: str,
+    envelope_recipient: str,
 ) -> str:
     req_type = str(control_req.get("req_type", "")).strip()
     req_status = str(control_req.get("status", "")).strip()
@@ -186,8 +188,12 @@ def validate_control_request_record(
         return f"request already resolved: status={req_status or 'unknown'}"
     if req_sender and requester and req_sender != requester:
         return f"request sender mismatch: expected={req_sender} got={requester}"
-    if req_recipient and req_recipient != recipient:
+    if not req_recipient:
+        return "request recipient missing"
+    if req_recipient != recipient:
         return f"request recipient mismatch: expected={req_recipient} got={recipient}"
+    if envelope_recipient and envelope_recipient != recipient:
+        return f"message recipient mismatch: expected={recipient} got={envelope_recipient}"
     return ""
 
 
@@ -231,6 +237,7 @@ def dispatch_message(
     summary: str = "",
     request_id: str = "",
     approve: bool | None = None,
+    meta: dict | None = None,
 ) -> None:
     cmd = [
         "dispatch",
@@ -253,6 +260,8 @@ def dispatch_message(
         cmd.extend(["--request-id", request_id])
     if approve is not None:
         cmd.extend(["--approve", "true" if approve else "false"])
+    if meta:
+        cmd.extend(["--meta", json.dumps(meta, ensure_ascii=False)])
     fs_cmd(fs_path, cmd)
 
 
@@ -261,6 +270,12 @@ def collect_collaboration_targets(messages: list[dict], *, self_agent: str) -> d
     for msg in messages:
         sender = str(msg.get("from", "")).strip()
         if not sender or sender == self_agent or sender in SYSTEM_SENDER_NAMES:
+            continue
+        summary = str(msg.get("summary", "")).strip().lower()
+        if summary.startswith("peer-"):
+            continue
+        meta = parse_meta(msg.get("meta"))
+        if str(meta.get("source", "")).strip() == "collab-update":
             continue
         if not is_actionable_work_message(msg):
             continue
@@ -306,7 +321,7 @@ def emit_collaboration_updates(
             kind = "answer"
             summary = "peer-answer"
         else:
-            kind = "status"
+            kind = "message"
             summary = "peer-update"
 
         body = f"collab_update from={sender} source_types={source_types_text} result={result_body}"
@@ -335,7 +350,24 @@ def emit_collaboration_updates(
             recipient=recipient,
             content=body,
             summary=summary,
+            meta={
+                "source": "collab-update",
+                "source_types": source_types,
+            },
         )
+
+
+def build_team_context_prompt(*, agent: str, session: str, config_path: Path, task_path: Path, lead: str) -> str:
+    return (
+        "# Agent Teammate Communication\n"
+        "You are running as an agent in a team. Use codex-teams sendmessage types "
+        "`message` and `broadcast` for team communication.\n\n"
+        "# Team Coordination\n"
+        f"You are teammate `{agent}` in team `{session}`.\n"
+        f"Team config: {config_path}\n"
+        f"Task list: {task_path}\n"
+        f"Team leader: {lead}\n"
+    )
 
 
 def fs_control_respond(
@@ -388,6 +420,7 @@ def handle_control_messages(
     for msg in messages:
         mtype = str(msg.get("type", ""))
         sender = str(msg.get("from", ""))
+        envelope_recipient = str(msg.get("recipient", "")).strip()
         request_id = str(msg.get("request_id", ""))
         text = str(msg.get("text", ""))
         summary = str(msg.get("summary", ""))
@@ -400,7 +433,12 @@ def handle_control_messages(
             control_req = load_control_request(args.repo, args.session, request_id, db_path) if request_id else {}
             has_control_req = bool(control_req)
 
-            if requester not in known_members:
+            if envelope_recipient != args.agent:
+                response_text = (
+                    "shutdown_request recipient mismatch: "
+                    f"expected={args.agent} got={envelope_recipient or '<missing>'}"
+                )
+            elif requester not in known_members:
                 response_text = f"unauthorized shutdown_request sender={requester or '<unknown>'}"
             elif requester != lead:
                 response_text = f"shutdown_request allowed only from lead={lead}; got={requester or '<unknown>'}"
@@ -410,6 +448,7 @@ def handle_control_messages(
                     expected_type="shutdown",
                     requester=requester,
                     recipient=args.agent,
+                    envelope_recipient=envelope_recipient,
                 )
                 if validation_error:
                     response_text = validation_error
@@ -507,7 +546,12 @@ def handle_control_messages(
             control_req = load_control_request(args.repo, args.session, request_id, db_path) if request_id else {}
             has_control_req = bool(control_req)
 
-            if requester not in known_members:
+            if envelope_recipient != args.agent:
+                response_text = (
+                    "mode_set_request recipient mismatch: "
+                    f"expected={args.agent} got={envelope_recipient or '<missing>'}"
+                )
+            elif requester not in known_members:
                 response_text = f"unauthorized mode_set_request sender={requester or '<unknown>'}"
             elif requester != lead:
                 response_text = f"mode_set_request allowed only from lead={lead}; got={requester or '<unknown>'}"
@@ -521,6 +565,7 @@ def handle_control_messages(
                     expected_type="mode_set",
                     requester=requester,
                     recipient=args.agent,
+                    envelope_recipient=envelope_recipient,
                 )
                 if validation_error:
                     response_text = validation_error
@@ -712,15 +757,12 @@ def main() -> int:
     paths = team_fs.resolve_paths(args.repo, args.session)
     cfg = team_fs.read_config(paths)
     lead = resolve_lead(cfg)
-    team_context_prompt = (
-        "# Agent Teammate Communication\n"
-        "You are running as an agent in a team. Use codex-teams sendmessage types "
-        "`message` and `broadcast` for team communication.\n\n"
-        "# Team Coordination\n"
-        f"You are teammate `{args.agent}` in team `{args.session}`.\n"
-        f"Team config: {paths.config}\n"
-        f"Task list: {paths.tasks}\n"
-        f"Team leader: {lead}\n"
+    team_context_prompt = build_team_context_prompt(
+        agent=args.agent,
+        session=args.session,
+        config_path=paths.config,
+        task_path=paths.tasks,
+        lead=lead,
     )
 
     fs_cmd(
@@ -801,9 +843,26 @@ def main() -> int:
         should_check_mailbox = force_mailbox_check or mention_token != last_mention_token
         unread: list[dict] = []
         if should_check_mailbox:
-            unread = load_unread_messages(paths, args.agent, limit=200)
+            try:
+                latest_cfg = team_fs.read_config(paths)
+                latest_lead = resolve_lead(latest_cfg)
+                if latest_lead and latest_lead != lead:
+                    lead = latest_lead
+                    team_context_prompt = build_team_context_prompt(
+                        agent=args.agent,
+                        session=args.session,
+                        config_path=paths.config,
+                        task_path=paths.tasks,
+                        lead=lead,
+                    )
+                cfg = latest_cfg
+            except Exception:
+                pass
+            unread = load_unread_messages(paths, args.agent, limit=WORKER_MAILBOX_BATCH)
             force_mailbox_check = False
             last_mention_token = mention_token
+            if len(unread) >= WORKER_MAILBOX_BATCH:
+                force_mailbox_check = True
 
         if unread:
             messages: list[dict] = []

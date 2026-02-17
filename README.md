@@ -5,7 +5,7 @@
 
 - 리더: 현재 Codex IDE 채팅 세션(외부 리더)
 - 워커: `worker-1`, `worker-2`, `worker-3` (고정 3명)
-- 기본 모드: `in-process-shared` (리소스 절약형)
+- 유일 런타임: `in-process-shared` (리소스 절약형)
 - 독립 실행: `codex-ma` 없이 `codex-teams`만으로 동작
 
 ## 1. 준비물
@@ -19,7 +19,6 @@
 
 선택:
 
-- `tmux` (`--teammate-mode tmux`를 쓸 때)
 - `sqlite3` (상태 확인에 유용)
 
 실행 전 게이트(필수):
@@ -55,7 +54,7 @@ codex-teams --help
 ```bash
 codex-teams deps --install
 ```
-위 명령은 누락된 기본 의존성(`git`, `python3`, `wslpath`, `sqlite3`, `tmux`) 설치를 시도합니다.
+위 명령은 누락된 기본 의존성(`git`, `python3`, `wslpath`, `sqlite3`) 설치를 시도합니다.
 (`codex` CLI는 수동 설치 대상)
 
 ## 3. 5분 시작 (가장 쉬운 방법)
@@ -129,20 +128,15 @@ codex-teams sendmessage --repo <repo> --session <session> \
   --type message --from lead --to worker-1 --content "이 작업 맡아줘"
 ```
 
-## 5. 모드 선택 가이드
+## 5. 런타임 가이드
 
-- `in-process-shared` (기본, 권장):
-  리소스 사용량이 가장 안정적이라 일반적으로 이 모드를 추천합니다.
-- `in-process`:
-  워커별 개별 프로세스.
-- `tmux`:
-  화면으로 워커를 직접 보며 운영할 때 사용.
+- `in-process-shared` 단일 런타임만 지원합니다.
+- `--teammate-mode auto`는 호환성 별칭으로 `in-process-shared`로 정규화됩니다.
 
 예시:
 
 ```bash
 codex-teams run --repo <repo> --session <session> --task "..." --teammate-mode in-process-shared
-codex-teams run --repo <repo> --session <session> --task "..." --teammate-mode tmux --tmux-layout split --dashboard
 ```
 
 ## 6. 설정 파일 (`.codex-multi-agent.config.sh`)
@@ -160,16 +154,11 @@ codex-teams init --repo <repo>
 # 워커 수는 고정 3 (다른 값 불가)
 COUNT=3
 
-# 기본 실행 모드 (권장)
+# 유일 실행 모드
 TEAMMATE_MODE="in-process-shared"
 
-# tmux 모드 설정
-TMUX_LAYOUT="split"
-ENABLE_TMUX_PULSE="false"
-TMUX_MAILBOX_POLL_MS="1500"
-
-# in-process 설정
-INPROCESS_POLL_MS="1000"
+# shared hub 설정
+INPROCESS_POLL_MS="250"
 INPROCESS_IDLE_MS="12000"
 INPROCESS_SHARED_STABILIZE_SEC="12"
 INPROCESS_SHARED_START_RETRIES="1"
@@ -189,7 +178,7 @@ CODEX_TEAM_GIT_BIN="$GIT_BIN"
 
 - `--workers`는 `3`만 허용됩니다.
 - 기본 리더는 현재 Codex 세션(외부 리더)입니다.
-- `TEAMMATE_MODE`를 바꾸지 않으면 기본값 `in-process-shared`로 실행됩니다.
+- `TEAMMATE_MODE`는 `in-process-shared`만 지원됩니다.
 
 ## 7. 결과 파일 위치
 
@@ -224,9 +213,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ```bash
 TEAMMATE_MODE="in-process-shared"
-ENABLE_TMUX_PULSE="false"
-TMUX_MAILBOX_POLL_MS="1500"
-INPROCESS_POLL_MS="1000"
+INPROCESS_POLL_MS="250"
 ```
 
 - in-process-shared 허브가 바로 종료될 때:
@@ -240,7 +227,7 @@ INPROCESS_POLL_MS="1000"
 - 같은 `<session>`에 대해 `up/run/teamdelete --force`를 병렬로 여러 터미널에서 동시에 실행하지 마세요.
   최신 버전은 세션 잠금을 사용하지만, 의도치 않은 강제 종료 가능성을 줄이려면 직렬 실행이 안전합니다.
 
-- 이미 실행 중인 in-process 세션에서 다시 `up/run`을 호출하면 차단됩니다.
+- 이미 실행 중인 in-process-shared 세션에서 다시 `up/run`을 호출하면 차단됩니다.
   중복 허브/워커를 띄우지 않기 위한 보호 동작입니다.
 
 - 자동 설치가 실패할 때:

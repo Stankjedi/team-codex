@@ -746,8 +746,8 @@ def build_teammates(cfg: dict[str, Any]) -> dict[str, Any]:
             "name": m.get("name", ""),
             "agentType": m.get("agentType", "member"),
             "color": m.get("color", "blue"),
-            "backendType": m.get("backendType", "tmux"),
-            "mode": m.get("mode", "auto"),
+            "backendType": m.get("backendType", "in-process-shared"),
+            "mode": m.get("mode", "in-process-shared"),
             "planModeRequired": bool(m.get("planModeRequired", False)),
         }
     return out
@@ -1507,8 +1507,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", default=os.getcwd())
     p.add_argument("--lead-session-id", default="")
     p.add_argument("--parent-session-id", default="")
-    p.add_argument("--backend-type", default="tmux")
-    p.add_argument("--mode", default="auto")
+    p.add_argument("--backend-type", default="in-process-shared")
+    p.add_argument("--mode", default="in-process-shared")
     p.add_argument("--replace", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_team_create)
@@ -1535,8 +1535,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--color", default="")
     p.add_argument("--plan-mode-required", action="store_true")
     p.add_argument("--cwd", default=os.getcwd())
-    p.add_argument("--backend-type", default="tmux")
-    p.add_argument("--mode", default="auto")
+    p.add_argument("--backend-type", default="in-process-shared")
+    p.add_argument("--mode", default="in-process-shared")
     p.add_argument("--tmux-pane-id", default="")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_member_add)
@@ -1698,7 +1698,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=os.getcwd())
     p.add_argument("--session", required=True)
     p.add_argument("--agent", required=True)
-    p.add_argument("--backend", default="tmux")
+    p.add_argument("--backend", default="in-process-shared")
     p.add_argument("--status", default="running")
     p.add_argument("--pid", type=int, default=0)
     p.add_argument("--pane-id", default="")

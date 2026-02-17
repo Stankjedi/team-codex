@@ -36,6 +36,10 @@ MAX_DRAIN_BYTES_PER_TICK = 64_000
 MAX_DRAIN_CHUNKS_PER_TICK = 16
 WORKER_MAILBOX_BATCH = 200
 LEAD_DONE_SCAN_BATCH = 500
+MAX_PROMPT_MESSAGES_PER_RUN = 8
+MAX_PROMPT_CHARS_PER_RUN = 12_000
+ACTIVE_LOOP_SLEEP_SEC = 0.02
+FAST_LOOP_SLEEP_SEC = 0.05
 
 
 @dataclass
@@ -44,6 +48,7 @@ class WorkerState:
     cwd: str
     prompt_prefix: str
     pending_texts: list[str] = field(default_factory=list)
+    pending_indexes: list[int] = field(default_factory=list)
     pending_targets: dict[str, set[str]] = field(default_factory=dict)
     last_activity: int = 0
     last_idle_sent: int = 0
@@ -54,6 +59,7 @@ class WorkerState:
     active_output_chunks: list[str] = field(default_factory=list)
     active_output_bytes: int = 0
     active_output_truncated: bool = False
+    active_indexes: list[int] = field(default_factory=list)
     stopped: bool = False
 
 
@@ -148,7 +154,7 @@ def load_unread_messages(paths: team_fs.FsPaths, worker: WorkerState, *, limit: 
             worker.args.agent,
             unread=True,
             limit=limit,
-            mark_read_selected=True,
+            mark_read_selected=False,
         )
     except Exception:
         return []
@@ -166,9 +172,8 @@ def load_unread_messages_no_mark(
     agent: str,
     *,
     limit: int,
-    skip_indexes: set[int] | None = None,
+    start_index: int = 0,
 ) -> list[dict]:
-    skip = skip_indexes or set()
     try:
         mailbox = team_fs.read_mailbox(paths, agent)
     except Exception:
@@ -176,7 +181,7 @@ def load_unread_messages_no_mark(
 
     rows: list[dict] = []
     for idx, row in enumerate(mailbox):
-        if idx in skip:
+        if idx < start_index:
             continue
         if not isinstance(row, dict):
             continue
@@ -222,6 +227,80 @@ def trim_seen_indexes(seen: set[int], *, keep: int = 6000) -> None:
     stale = [idx for idx in seen if idx < floor]
     for idx in stale:
         seen.discard(idx)
+
+
+def mark_worker_indexes_read(paths: team_fs.FsPaths, worker: WorkerState, indexes: list[int]) -> None:
+    if not indexes:
+        return
+    unique = sorted({idx for idx in indexes if isinstance(idx, int) and idx >= 0})
+    if not unique:
+        return
+    try:
+        marked = team_fs.mark_read(paths, worker.args.agent, indexes=unique, mark_all=False)
+    except Exception:
+        marked = 0
+    if marked < len(unique):
+        worker.force_mailbox_check = True
+
+
+def pop_worker_prompt_batch(worker: WorkerState) -> tuple[list[str], list[int]]:
+    lines: list[str] = []
+    indexes: list[int] = []
+    total_chars = 0
+
+    while worker.pending_texts and len(lines) < MAX_PROMPT_MESSAGES_PER_RUN:
+        next_line = worker.pending_texts[0]
+        projected = total_chars + len(next_line) + 1
+        if lines and projected > MAX_PROMPT_CHARS_PER_RUN:
+            break
+        lines.append(worker.pending_texts.pop(0))
+        total_chars = projected
+        if worker.pending_indexes:
+            indexes.append(worker.pending_indexes.pop(0))
+        if total_chars >= MAX_PROMPT_CHARS_PER_RUN:
+            break
+
+    return lines, indexes
+
+
+def build_prompt_prefix(*, session: str, config_path: Path, task_path: Path, lead: str, name: str) -> str:
+    return (
+        "# Agent Teammate Communication\n"
+        "You are running as an agent in a team. Use codex-teams sendmessage types "
+        "`message` and `broadcast` for team communication.\n\n"
+        "# Team Coordination\n"
+        f"You are a teammate in team `{session}`.\n"
+        f"Team config: {config_path}\n"
+        f"Task list: {task_path}\n"
+        f"Team leader: {lead}\n"
+        f"\n**Your Identity:**\n- Name: {name}\n"
+    )
+
+
+def compute_loop_sleep(
+    *,
+    args: argparse.Namespace,
+    workers: list[WorkerState],
+    force_lead_scan: bool,
+    did_work: bool,
+) -> float:
+    if did_work:
+        return ACTIVE_LOOP_SLEEP_SEC
+    if force_lead_scan:
+        return ACTIVE_LOOP_SLEEP_SEC
+    active_proc_present = False
+    for worker in workers:
+        if worker.stopped:
+            continue
+        if worker.active_proc is not None:
+            active_proc_present = True
+            continue
+        if worker.pending_texts or worker.force_mailbox_check:
+            return ACTIVE_LOOP_SLEEP_SEC
+    if active_proc_present:
+        return FAST_LOOP_SLEEP_SEC
+    idle_sleep = max(FAST_LOOP_SLEEP_SEC, args.poll_ms / 1000.0)
+    return min(idle_sleep, 0.25)
 
 
 def all_workers_review_ready(workers: list[WorkerState], worker_done: dict[str, bool]) -> bool:
@@ -516,6 +595,7 @@ def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None
     drain_worker_output(worker, drain_all=True)
     worker.active_proc = None
     worker.active_started_ms = 0
+    worker.active_indexes = []
     reset_worker_output_capture(worker)
 
 
@@ -560,17 +640,6 @@ def main() -> int:
     lead_cwd = str(Path(args.lead_cwd).resolve()) if args.lead_cwd.strip() else str(Path(args.repo).resolve())
     lead_profile = args.lead_profile.strip() or args.profile
     lead_model = args.lead_model.strip() or args.model
-    prompt_base = (
-        "# Agent Teammate Communication\n"
-        "You are running as an agent in a team. Use codex-teams sendmessage types "
-        "`message` and `broadcast` for team communication.\n\n"
-        "# Team Coordination\n"
-        f"You are a teammate in team `{args.session}`.\n"
-        f"Team config: {paths.config}\n"
-        f"Task list: {paths.tasks}\n"
-        f"Team leader: {lead}\n"
-    )
-
     worktrees_root = Path(args.worktrees_root).resolve()
     workers: list[WorkerState] = []
     worker_names: list[str] = []
@@ -627,7 +696,13 @@ def main() -> int:
             WorkerState(
                 args=wargs,
                 cwd=cwd,
-                prompt_prefix=f"{prompt_base}\n**Your Identity:**\n- Name: {name}\n",
+                prompt_prefix=build_prompt_prefix(
+                    session=args.session,
+                    config_path=paths.config,
+                    task_path=paths.tasks,
+                    lead=lead,
+                    name=name,
+                ),
                 last_activity=now_ms(),
                 last_mention_token=0,
                 force_mailbox_check=False,
@@ -688,10 +763,28 @@ def main() -> int:
     }
     review_ready_announced = False
     lead_last_mention_token = 0
-    lead_seen_indexes: set[int] = set()
+    lead_last_scanned_index = 0
     force_lead_scan = False
     last_heartbeat = 0
     while not STOP and any(not w.stopped for w in workers):
+        did_work = False
+        try:
+            latest_cfg = team_fs.read_config(paths)
+            latest_lead = args.lead_name.strip() or team_fs.lead_name(latest_cfg)
+            if latest_lead and latest_lead != lead:
+                lead = latest_lead
+                for worker in workers:
+                    worker.prompt_prefix = build_prompt_prefix(
+                        session=args.session,
+                        config_path=paths.config,
+                        task_path=paths.tasks,
+                        lead=lead,
+                        name=worker.args.agent,
+                    )
+            cfg = latest_cfg
+        except Exception:
+            pass
+
         for worker in workers:
             if STOP or worker.stopped:
                 continue
@@ -706,43 +799,94 @@ def main() -> int:
                 if len(unread) >= WORKER_MAILBOX_BATCH:
                     worker.force_mailbox_check = True
             if unread:
-                messages: list[dict] = []
-                for item in unread:
-                    messages.append(item)
+                messages = unread
+                should_shutdown = False
+                work_messages: list[dict] = []
+                try:
+                    should_shutdown, work_messages = agent_loop.handle_control_messages(
+                        args=worker.args,
+                        fs_path=fs_path,
+                        bus_path=bus_path,
+                        db_path=db_path,
+                        messages=messages,
+                        cfg=cfg,
+                    )
+                except Exception as exc:
+                    worker.force_mailbox_check = True
+                    bus_cmd(
+                        bus_path,
+                        db_path,
+                        [
+                            "send",
+                            "--room",
+                            worker.args.room,
+                            "--from",
+                            "system",
+                            "--to",
+                            lead,
+                            "--kind",
+                            "blocker",
+                            "--body",
+                            f"hub message handling failed agent={worker.args.agent} error={exc}",
+                        ],
+                    )
+                    append_lifecycle(
+                        args.lifecycle_log,
+                        f"worker-message-handle-error agent={worker.args.agent} error={exc}",
+                    )
+                    continue
 
-                should_shutdown, work_messages = agent_loop.handle_control_messages(
-                    args=worker.args,
-                    fs_path=fs_path,
-                    bus_path=bus_path,
-                    db_path=db_path,
-                    messages=messages,
-                    cfg=cfg,
-                )
+                actionable_indexes: set[int] = set()
+                for msg in work_messages:
+                    idx = msg.get("index")
+                    if isinstance(idx, int) and idx >= 0:
+                        actionable_indexes.add(idx)
+                immediate_ack_indexes: list[int] = []
+                for row in messages:
+                    idx = row.get("index")
+                    if not isinstance(idx, int) or idx < 0:
+                        continue
+                    if idx not in actionable_indexes:
+                        immediate_ack_indexes.append(idx)
+                mark_worker_indexes_read(paths, worker, immediate_ack_indexes)
+                immediate_ack_indexes = []
+
                 if should_shutdown:
+                    mark_worker_indexes_read(paths, worker, sorted(actionable_indexes))
                     terminate_worker_proc(worker)
                     worker.stopped = True
                     worker_offline(bus_path, db_path, fs_path, worker)
+                    did_work = True
                     continue
 
                 for msg in work_messages:
+                    idx = msg.get("index")
+                    msg_index = idx if isinstance(idx, int) and idx >= 0 else None
                     text = str(msg.get("text", "")).strip()
                     summary = str(msg.get("summary", "")).strip()
                     sender = str(msg.get("from", ""))
                     if text:
                         worker.pending_texts.append(f"from={sender} summary={summary} text={text}".strip())
+                        worker.pending_indexes.append(msg_index if msg_index is not None else -1)
+                    elif msg_index is not None:
+                        immediate_ack_indexes.append(msg_index)
                 agent_loop.merge_collaboration_targets(
                     worker.pending_targets,
                     agent_loop.collect_collaboration_targets(work_messages, self_agent=worker.args.agent),
                 )
+                mark_worker_indexes_read(paths, worker, immediate_ack_indexes)
                 if work_messages:
                     worker.last_activity = now_ms()
                     if worker.args.role == "worker":
                         worker_done[worker.args.agent] = False
                         review_ready_announced = False
+                    did_work = True
 
             if worker.pending_texts and worker.active_proc is None:
-                prompt = "\n".join(worker.pending_texts)
-                worker.pending_texts = []
+                prompt_lines, prompt_indexes = pop_worker_prompt_batch(worker)
+                if not prompt_lines:
+                    continue
+                prompt = "\n".join(prompt_lines)
                 prompt = f"{worker.prompt_prefix}\n\n{prompt}"
                 cmd = build_worker_cmd(worker, prompt)
                 proc, err = spawn_cmd(cmd, cwd=worker.cwd)
@@ -756,14 +900,17 @@ def main() -> int:
                         exit_code=127,
                         run_out=err,
                     )
+                    mark_worker_indexes_read(paths, worker, prompt_indexes)
                 else:
                     worker.active_proc = proc
                     worker.active_started_ms = now_ms()
                     worker.last_activity = worker.active_started_ms
+                    worker.active_indexes = prompt_indexes
                     reset_worker_output_capture(worker)
                     if worker.args.role == "worker":
                         worker_done[worker.args.agent] = False
                         review_ready_announced = False
+                did_work = True
 
             if worker.active_proc is not None:
                 drain_worker_output(worker)
@@ -783,6 +930,9 @@ def main() -> int:
                         exit_code=exit_code,
                         run_out=run_out,
                     )
+                    mark_worker_indexes_read(paths, worker, worker.active_indexes)
+                    worker.active_indexes = []
+                    did_work = True
 
             current = now_ms()
             if (
@@ -821,6 +971,7 @@ def main() -> int:
                     ],
                 )
                 worker.last_idle_sent = current
+                did_work = True
 
         lead_mention_token = team_fs.mailbox_signal_token(paths, lead)
         should_scan_lead = force_lead_scan or lead_mention_token != lead_last_mention_token
@@ -829,15 +980,14 @@ def main() -> int:
                 paths,
                 lead,
                 limit=LEAD_DONE_SCAN_BATCH,
-                skip_indexes=lead_seen_indexes,
+                start_index=lead_last_scanned_index,
             )
             for row in lead_rows:
                 idx = row.get("index")
                 if not isinstance(idx, int) or idx < 0:
                     continue
-                if idx in lead_seen_indexes:
-                    continue
-                lead_seen_indexes.add(idx)
+                if idx >= lead_last_scanned_index:
+                    lead_last_scanned_index = idx + 1
                 sender = str(row.get("from", "")).strip()
                 if sender not in worker_done:
                     continue
@@ -848,10 +998,11 @@ def main() -> int:
                 if agent_loop.is_actionable_work_message(row):
                     worker_done[sender] = False
                     review_ready_announced = False
-            trim_seen_indexes(lead_seen_indexes)
             force_lead_scan = bool(LEAD_DONE_SCAN_BATCH > 0 and len(lead_rows) >= LEAD_DONE_SCAN_BATCH)
             if not force_lead_scan:
                 lead_last_mention_token = lead_mention_token
+            if lead_rows:
+                did_work = True
 
         if not review_ready_announced and all_workers_review_ready(workers, worker_done):
             notify_review_ready(
@@ -865,6 +1016,7 @@ def main() -> int:
                 worker_done=worker_done,
             )
             review_ready_announced = True
+            did_work = True
 
         current_loop_ms = now_ms()
         if current_loop_ms - last_heartbeat >= max(500, args.poll_ms):
@@ -883,7 +1035,14 @@ def main() -> int:
             )
             last_heartbeat = current_loop_ms
 
-        time.sleep(max(0.1, args.poll_ms / 1000.0))
+        time.sleep(
+            compute_loop_sleep(
+                args=args,
+                workers=workers,
+                force_lead_scan=force_lead_scan,
+                did_work=did_work,
+            )
+        )
 
     for worker in workers:
         terminate_worker_proc(worker)

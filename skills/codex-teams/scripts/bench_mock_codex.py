@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Mock codex binary for codex-teams benchmarks.
-
-Supports:
-- batch mode: `<bin> exec ...` (used by in-process backends)
-- interactive stdin mode (used by tmux backend wrapper)
-"""
+"""Mock codex binary for codex-teams shared runtime benchmarks."""
 
 from __future__ import annotations
 
@@ -101,7 +96,7 @@ def interactive_mode() -> int:
             if dedupe_key not in seen:
                 seen.add(dedupe_key)
                 recipient = sender if sender and sender != "all" else lead
-                body = f"mock tmux processed by {agent}"
+                body = f"mock shared processed by {agent}"
                 run_fs_dispatch(
                     repo=repo,
                     session=session,

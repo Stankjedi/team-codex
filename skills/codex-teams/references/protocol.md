@@ -25,31 +25,21 @@ Platform:
 
 2. `run/up`
 - selects backend:
-  - default mode (when omitted): `in-process-shared`
-  - `tmux` (`--tmux-layout split|window`)
-  - `in-process` (one teammate loop per process)
-  - `in-process-shared` (one supervisor loop for all teammates)
-  - `auto` resolves by runtime context:
-    - non-interactive -> `in-process`
-    - interactive + inside tmux -> `tmux`
-    - interactive + outside tmux -> `in-process`
-- `tmux` backend starts `swarm` + `team-monitor` windows (`swarm`에는 worker pane만 생성)
-- `team-pulse` window is optional (`ENABLE_TMUX_PULSE=true` when needed)
-- `tmux` backend starts `team-mailbox` bridge window to inject unread mailbox messages into panes
-- `in-process` backends run mailbox poll loops and emit lifecycle status via bus/fs
-- `in-process` backends auto-reply to non-lead teammate senders for continuous worker collaboration
+  - only supported mode: `in-process-shared`
+  - `auto` is accepted as compatibility alias and resolves to `in-process-shared`
+- `in-process-shared` backend runs a single shared hub process and supervises worker-1/2/3 loops
+- mailbox handling is mention-driven with backlog draining when queues exceed batch size
 - default perf knobs:
   - `TEAMMATE_MODE=in-process-shared`
-  - `TMUX_MAILBOX_POLL_MS=1500`
-  - `INPROCESS_POLL_MS=1000`
+  - `INPROCESS_POLL_MS=250`
 - emits startup `system` status messages
 - fixed worker pool policy: `worker-1`, `worker-2`, `worker-3` only (`--workers` accepts only `3`)
-- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(continuous) -> on-demand-research-by-lead -> lead-review -> assigned-worker-push/merge`
+- emits fixed workflow `status`: `lead-research+plan -> delegate -> peer-qa(continuous) -> on-demand-research-by-lead -> feedback-loop(lead<->workers) -> lead-review -> assigned-worker-push/merge`
 - lead는 orchestration-only로 유지되며 구현 태스크를 직접 수행하지 않음
 - default auto-delegates initial task from `lead` to each worker agent with role-specific execution prompt
 
 3. `teamdelete`
-- removes team directory (and force-kills active runtime agents/tmux session when `--force`)
+- removes team directory (and force-kills active runtime agents when `--force`)
 
 ## Roles
 

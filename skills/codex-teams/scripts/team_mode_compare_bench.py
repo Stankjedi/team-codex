@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark codex-teams backend modes (tmux, in-process, in-process-shared)."""
+"""Benchmark codex-teams in-process-shared runtime profile."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ MOCK_CODEX = SCRIPT_DIR / "bench_mock_codex.py"
 
 
 WORKERS = ["worker-1", "worker-2", "worker-3"]
-VALID_MODES = {"tmux", "in-process", "in-process-shared"}
+VALID_MODES = {"in-process-shared"}
 
 
 class BenchError(RuntimeError):
@@ -251,52 +251,20 @@ def wait_for_worker_ack_with_sampling(
 
 def mode_pids(repo: Path, session: str, mode: str, *, env: dict[str, str]) -> list[int]:
     pids: set[int] = set()
-
-    if mode in {"in-process", "in-process-shared"}:
-        out = fs_cmd(repo, session, ["runtime-list", "--json"], env=env)
-        try:
-            rt = json.loads(out)
-        except json.JSONDecodeError:
-            rt = {}
-        if isinstance(rt, dict):
-            agents = rt.get("agents", {})
-            if isinstance(agents, dict):
-                for rec in agents.values():
-                    if not isinstance(rec, dict):
-                        continue
-                    pid = int(rec.get("pid", 0) or 0)
-                    if pid > 0:
-                        pids.add(pid)
-    else:
-        out = run_cmd(["tmux", "display-message", "-p", "-t", session, "#{pid}"], env=env, check=False)
-        try:
-            tmux_pid = int(out.strip())
-            if tmux_pid > 0:
-                pids.add(tmux_pid)
-        except ValueError:
-            pass
-
-        ps_out = run_cmd(["ps", "-eo", "pid=,args="], env=env, check=False)
-        repo_marker = str(repo)
-        markers = ("bench_mock_codex.py", "team_tmux_mailbox_bridge.py", "team_tail.sh")
-        for line in ps_out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                pid_text, args = line.split(" ", 1)
-            except ValueError:
-                continue
-            if repo_marker not in args:
-                continue
-            if not any(marker in args for marker in markers):
-                continue
-            try:
-                pid = int(pid_text)
-            except ValueError:
-                continue
-            if pid > 0:
-                pids.add(pid)
+    out = fs_cmd(repo, session, ["runtime-list", "--json"], env=env)
+    try:
+        rt = json.loads(out)
+    except json.JSONDecodeError:
+        rt = {}
+    if isinstance(rt, dict):
+        agents = rt.get("agents", {})
+        if isinstance(agents, dict):
+            for rec in agents.values():
+                if not isinstance(rec, dict):
+                    continue
+                pid = int(rec.get("pid", 0) or 0)
+                if pid > 0:
+                    pids.add(pid)
 
     alive: list[int] = []
     for pid in sorted(pids):
@@ -312,16 +280,8 @@ def wait_mode_ready(repo: Path, session: str, mode: str, *, env: dict[str, str],
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         pids = mode_pids(repo, session, mode, env=env)
-        if mode == "tmux":
-            # tmux server + 3 workers + mailbox bridge + monitor script expected in normal case.
-            if len(pids) >= 4:
-                return
-        elif mode == "in-process":
-            if len(pids) >= 3:
-                return
-        else:
-            if len(pids) >= 1:
-                return
+        if len(pids) >= 1:
+            return
         time.sleep(0.2)
     raise BenchError(f"mode not ready within timeout: mode={mode}")
 
@@ -369,7 +329,6 @@ def run_one_mode(
                 "--teammate-mode",
                 mode,
                 "--no-auto-delegate",
-                "--no-attach",
             ],
             env=mode_env,
         )
@@ -457,8 +416,8 @@ def run_one_mode(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compare codex-teams backend modes by measured performance")
-    parser.add_argument("--modes", default="tmux,in-process,in-process-shared")
+    parser = argparse.ArgumentParser(description="Profile codex-teams in-process-shared runtime performance")
+    parser.add_argument("--modes", default="in-process-shared")
     parser.add_argument("--idle-sec", type=float, default=8.0)
     parser.add_argument("--throughput-tasks", type=int, default=12)
     parser.add_argument("--sample-interval-sec", type=float, default=0.5)

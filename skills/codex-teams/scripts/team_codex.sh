@@ -8,12 +8,7 @@ STATUS="$SCRIPT_DIR/team_status.sh"
 MAILBOX="$SCRIPT_DIR/team_mailbox.sh"
 CONTROL="$SCRIPT_DIR/team_control.sh"
 MODEL_RESOLVER="$SCRIPT_DIR/resolve_model.py"
-DASHBOARD_SCRIPT="$SCRIPT_DIR/team_dashboard.sh"
-PULSE_SCRIPT="$SCRIPT_DIR/team_pulse.sh"
-TAIL_SCRIPT="$SCRIPT_DIR/team_tail.sh"
-INPROCESS_AGENT="$SCRIPT_DIR/team_inprocess_agent.py"
 INPROCESS_HUB="$SCRIPT_DIR/team_inprocess_hub.py"
-TMUX_MAILBOX_BRIDGE="$SCRIPT_DIR/team_tmux_mailbox_bridge.py"
 VIEWER_BRIDGE_FILE=".codex-teams/.viewer-session.json"
 WINDOWS_GIT_EXE_PATH="/mnt/c/Program Files/Git/cmd/git.exe"
 
@@ -23,15 +18,6 @@ CONFIG=""
 TASK=""
 ROOM="main"
 WORKERS=""
-NO_ATTACH="false"
-DASHBOARD="false"
-DASHBOARD_WINDOW="team-dashboard"
-DASHBOARD_LINES="18"
-DASHBOARD_MESSAGES="24"
-PULSE_WINDOW="team-pulse"
-MAILBOX_WINDOW="team-mailbox"
-MONITOR_WINDOW="team-monitor"
-SWARM_WINDOW="swarm"
 
 MODEL=""
 DIRECTOR_MODEL=""
@@ -48,19 +34,14 @@ DELETE_FORCE="false"
 TEAM_LEAD_NAME="lead"
 LEAD_AGENT_TYPE="team-lead"
 TEAMMATE_MODE="in-process-shared"
-TMUX_LAYOUT="split"
 PERMISSION_MODE="default"
 PLAN_MODE_REQUIRED="false"
 TEAMMATE_MODE_OVERRIDE=""
-TMUX_LAYOUT_OVERRIDE=""
 PERMISSION_MODE_OVERRIDE=""
 PLAN_MODE_REQUIRED_OVERRIDE=""
 AUTO_DELEGATE="true"
 AUTO_DELEGATE_OVERRIDE=""
-AUTO_KILL_DONE_WORKER_TMUX="true"
-ENABLE_TMUX_PULSE="false"
-TMUX_MAILBOX_POLL_MS="1500"
-INPROCESS_POLL_MS="1000"
+INPROCESS_POLL_MS="250"
 INPROCESS_IDLE_MS="12000"
 # in-process-shared startup 안정성 확인 구간(초).
 INPROCESS_SHARED_STABILIZE_SEC="12"
@@ -105,7 +86,7 @@ declare -A BOOT_PROMPT_BY_AGENT=()
 
 usage() {
   cat <<'USAGE'
-Codex Teams (Windows+WSL only, filesystem mailbox + bus + tmux/in-process backends)
+Codex Teams (Windows+WSL only, filesystem mailbox + bus + in-process-shared runtime)
 
 Usage:
   team_codex.sh <command> [options]
@@ -116,7 +97,7 @@ Commands:
   setup                   Prepare repository (git init + initial commit) for codex-teams
   run                     TeamCreate + spawn teammates + inject task
   up                      Same as run without task injection
-  status                  Show runtime/team/bus/tmux status
+  status                  Show runtime/team/bus status
   merge                   Merge worker branches into current branch
   teamcreate              Create team config/inboxes/state
   teamdelete              Delete team artifacts
@@ -141,15 +122,11 @@ Common options:
   --git-bin PATH          Git binary override (default: git; supports C:\... auto-convert)
 
 Backend options:
-  --teammate-mode MODE    auto|tmux|in-process|in-process-shared (default: in-process-shared)
-  --tmux-layout MODE      split|window (default: split)
+  --teammate-mode MODE    in-process-shared (auto is accepted as alias)
   --permission-mode MODE  default|acceptEdits|bypassPermissions|plan|delegate|dontAsk
   --plan-mode-required    Mark teammate config as plan-mode required
-  config: AUTO_KILL_DONE_WORKER_TMUX=true|false (tmux mode에서 lead가 done 워커 pane/window 자동 종료)
-  config: ENABLE_TMUX_PULSE=true|false (tmux pane heartbeat window; 기본 false)
-  config: TMUX_MAILBOX_POLL_MS=1500 (tmux mailbox bridge poll interval, ms)
-  config: INPROCESS_POLL_MS=1000 (in-process mailbox poll interval, ms)
-  config: INPROCESS_IDLE_MS=12000 (in-process idle status cadence, ms)
+  config: INPROCESS_POLL_MS=250 (hub mailbox poll interval, ms)
+  config: INPROCESS_IDLE_MS=12000 (idle status cadence, ms)
   config: INPROCESS_SHARED_STABILIZE_SEC=12 (in-process-shared startup stability window, sec)
   config: INPROCESS_SHARED_START_RETRIES=1 (in-process-shared startup retry count)
   config: SESSION_LOCK_WAIT_SEC=20 (session/repo lock wait timeout, sec)
@@ -159,11 +136,6 @@ run/up options:
   --task TEXT             Initial task text (required for run)
   --auto-delegate         Auto-delegate initial task to role agents (default)
   --no-auto-delegate      Disable automatic worker delegation
-  --dashboard             Launch team-dashboard window (tmux backend)
-  --dashboard-window NAME Dashboard window name
-  --dashboard-lines N     Dashboard pane lines
-  --dashboard-messages N  Dashboard recent message count
-  --no-attach             Do not attach tmux session after launch
 
 init/teamcreate/teamdelete options:
   --team-name NAME        Team name override (default: session)
@@ -192,8 +164,7 @@ Examples:
   team_codex.sh deps
   team_codex.sh deps --install
   team_codex.sh setup --repo .
-  team_codex.sh run --task "Fix flaky tests" --teammate-mode in-process-shared --no-attach
-  team_codex.sh run --task "UI pass" --teammate-mode tmux --tmux-layout split --dashboard
+  team_codex.sh run --task "Fix flaky tests" --teammate-mode in-process-shared
   team_codex.sh sendmessage --type shutdown_request --from lead --to worker-2 --content "stop now"
   team_codex.sh sendmessage --type shutdown_response --from lead --to worker-2 --request-id abc123 --approve --content "ok"
 USAGE
@@ -409,9 +380,6 @@ package_name_for_command() {
           printf '%s\n' "sqlite3"
           ;;
       esac
-      ;;
-    tmux)
-      printf '%s\n' "tmux"
       ;;
     wslpath)
       case "$pm" in
@@ -640,29 +608,11 @@ resolve_boot_git_bin() {
   normalize_git_bin_path "$candidate"
 }
 
-is_non_interactive_session() {
-  [[ ! -t 0 || ! -t 1 ]]
-}
-
-is_inside_tmux_sync() {
-  [[ -n "${TMUX:-}" ]]
-}
-
 resolve_teammate_backend() {
-  local requested="${1:-auto}"
+  local requested="${1:-in-process-shared}"
   case "$requested" in
-    tmux|in-process|in-process-shared)
-      printf '%s\n' "$requested"
-      return 0
-      ;;
-    auto)
-      if is_non_interactive_session; then
-        printf '%s\n' "in-process"
-      elif is_inside_tmux_sync; then
-        printf '%s\n' "tmux"
-      else
-        printf '%s\n' "in-process"
-      fi
+    in-process-shared|auto)
+      printf '%s\n' "in-process-shared"
       return 0
       ;;
     *)
@@ -835,7 +785,7 @@ abs_path_from() {
 
 write_viewer_bridge() {
   local backend="${1:-$RESOLVED_BACKEND}"
-  local layout="${2:-$TMUX_LAYOUT}"
+  local layout="${2:-shared}"
   local bridge_path="$REPO/$VIEWER_BRIDGE_FILE"
   mkdir -p "$(dirname "$bridge_path")"
   python3 - "$bridge_path" "$TMUX_SESSION" "$ROOM" "$REPO" "$backend" "$layout" <<'PY'
@@ -884,12 +834,6 @@ if str(payload.get("session", "")) == session:
 PY
 }
 
-window_exists() {
-  local session="$1"
-  local window_name="$2"
-  tmux list-windows -t "$session" -F "#{window_name}" 2>/dev/null | grep -Fxq "$window_name"
-}
-
 role_from_agent_name() {
   local agent="$1"
   case "$agent" in
@@ -918,8 +862,13 @@ role_default_model() {
 }
 
 role_peer_name() {
-  local _agent="$1"
-  printf '%s\n' "$TEAM_LEAD_NAME"
+  local agent="$1"
+  case "$agent" in
+    worker-1) printf '%s\n' "worker-2" ;;
+    worker-2) printf '%s\n' "worker-3" ;;
+    worker-3) printf '%s\n' "worker-1" ;;
+    *) printf '%s\n' "$TEAM_LEAD_NAME" ;;
+  esac
 }
 
 derive_role_team_shape() {
@@ -966,14 +915,10 @@ load_config_or_defaults() {
   LEAD_PROFILE="$DIRECTOR_PROFILE"
   MERGE_STRATEGY="merge"
   TEAMMATE_MODE="in-process-shared"
-  TMUX_LAYOUT="split"
   PERMISSION_MODE="default"
   PLAN_MODE_REQUIRED="false"
   AUTO_DELEGATE="true"
-  AUTO_KILL_DONE_WORKER_TMUX="true"
-  ENABLE_TMUX_PULSE="false"
-  TMUX_MAILBOX_POLL_MS="1500"
-  INPROCESS_POLL_MS="1000"
+  INPROCESS_POLL_MS="250"
   INPROCESS_IDLE_MS="12000"
   INPROCESS_SHARED_STABILIZE_SEC="12"
   INPROCESS_SHARED_START_RETRIES="1"
@@ -1022,9 +967,6 @@ load_config_or_defaults() {
   fi
   if [[ -n "$TEAMMATE_MODE_OVERRIDE" ]]; then
     TEAMMATE_MODE="$TEAMMATE_MODE_OVERRIDE"
-  fi
-  if [[ -n "$TMUX_LAYOUT_OVERRIDE" ]]; then
-    TMUX_LAYOUT="$TMUX_LAYOUT_OVERRIDE"
   fi
   if [[ -n "$PERMISSION_MODE_OVERRIDE" ]]; then
     PERMISSION_MODE="$PERMISSION_MODE_OVERRIDE"
@@ -1080,16 +1022,17 @@ load_config_or_defaults() {
   case "$USE_BASE_WIP" in true|false) ;; *) abort "USE_BASE_WIP must be true/false" ;; esac
   case "$ALLOW_DIRTY" in true|false) ;; *) abort "ALLOW_DIRTY must be true/false" ;; esac
   case "$KILL_EXISTING_SESSION" in true|false) ;; *) abort "KILL_EXISTING_SESSION must be true/false" ;; esac
-  case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "TEAMMATE_MODE must be auto|tmux|in-process|in-process-shared" ;; esac
-  case "$TMUX_LAYOUT" in split|window) ;; *) abort "TMUX_LAYOUT must be split|window" ;; esac
+  if [[ "$TEAMMATE_MODE" != "auto" && "$TEAMMATE_MODE" != "in-process-shared" ]]; then
+    echo "info: unsupported TEAMMATE_MODE=$TEAMMATE_MODE; forcing in-process-shared" >&2
+    TEAMMATE_MODE="in-process-shared"
+  fi
+  case "$TEAMMATE_MODE" in auto|in-process-shared) ;; *) abort "TEAMMATE_MODE must be in-process-shared (auto alias allowed)" ;; esac
+  if [[ "$TEAMMATE_MODE" == "auto" ]]; then
+    TEAMMATE_MODE="in-process-shared"
+  fi
   case "$MERGE_STRATEGY" in merge|cherry-pick) ;; *) abort "MERGE_STRATEGY must be merge|cherry-pick" ;; esac
   case "$PLAN_MODE_REQUIRED" in true|false) ;; *) abort "PLAN_MODE_REQUIRED must be true|false" ;; esac
   case "$AUTO_DELEGATE" in true|false) ;; *) abort "AUTO_DELEGATE must be true|false" ;; esac
-  case "$AUTO_KILL_DONE_WORKER_TMUX" in true|false) ;; *) abort "AUTO_KILL_DONE_WORKER_TMUX must be true|false" ;; esac
-  case "$ENABLE_TMUX_PULSE" in true|false) ;; *) abort "ENABLE_TMUX_PULSE must be true|false" ;; esac
-  if ! [[ "$TMUX_MAILBOX_POLL_MS" =~ ^[0-9]+$ ]] || [[ "$TMUX_MAILBOX_POLL_MS" -lt 100 ]]; then
-    abort "TMUX_MAILBOX_POLL_MS must be numeric and >= 100"
-  fi
   if ! [[ "$INPROCESS_POLL_MS" =~ ^[0-9]+$ ]] || [[ "$INPROCESS_POLL_MS" -lt 100 ]]; then
     abort "INPROCESS_POLL_MS must be numeric and >= 100"
   fi
@@ -1147,26 +1090,6 @@ except Exception:
 for m in cfg.get("members", []):
     if isinstance(m, dict) and m.get("name"):
         print(str(m.get("name")))
-PY
-}
-
-fs_member_color() {
-  local name="$1"
-  python3 - "$TEAM_CONFIG" "$name" <<'PY'
-import json
-import sys
-path, name = sys.argv[1], sys.argv[2]
-color = "blue"
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    for m in cfg.get("members", []):
-        if isinstance(m, dict) and str(m.get("name", "")) == name:
-            color = str(m.get("color", "blue"))
-            break
-except Exception:
-    pass
-print(color)
 PY
 }
 
@@ -1244,7 +1167,7 @@ create_or_refresh_team_context() {
 
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
-    --body "team_created name=$team_name session=$TMUX_SESSION roles=[$TEAM_ROLE_SUMMARY] members=$total_members runtime_members=${#TEAM_AGENT_NAMES[@]} lead_mode=external mode=$RESOLVED_BACKEND layout=$TMUX_LAYOUT" >/dev/null
+    --body "team_created name=$team_name session=$TMUX_SESSION roles=[$TEAM_ROLE_SUMMARY] members=$total_members runtime_members=${#TEAM_AGENT_NAMES[@]} lead_mode=external mode=$RESOLVED_BACKEND layout=shared" >/dev/null
 }
 
 ensure_worktrees() {
@@ -1302,145 +1225,6 @@ ensure_worktrees() {
   done
 }
 
-make_wrapper() {
-  WRAPPER="$TEAM_ROOT/codex-model-wrapper.sh"
-  cat > "$WRAPPER" <<__WRAPPER__
-#!/usr/bin/env bash
-set -euo pipefail
-
-BUS_SCRIPT="$BUS"
-FS_SCRIPT="$FS"
-DB_PATH="$DB"
-ROOM_NAME="$ROOM"
-REPO_PATH="$REPO"
-SESSION_NAME="$TMUX_SESSION"
-DIRECTOR_PROFILE_VALUE="$DIRECTOR_PROFILE"
-WORKER_PROFILE_VALUE="$WORKER_PROFILE"
-TEAM_LEAD_NAME_VALUE="$TEAM_LEAD_NAME"
-DEFAULT_MODEL_VALUE="$MODEL"
-CODEX_BIN_VALUE="$CODEX_BIN"
-GIT_BIN_VALUE="$GIT_BIN"
-PERMISSION_MODE_VALUE="$PERMISSION_MODE"
-
-export CODEX_EXPERIMENTAL_AGENT_TEAMS=1
-export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
-export CODEX_TEAM_GIT_BIN="\$GIT_BIN_VALUE"
-
-agent_name="\${CODEX_TEAM_AGENT:-}"
-agent_role="\${CODEX_TEAM_ROLE:-worker}"
-role_profile=""
-agent_cwd=""
-args=("\$@")
-
-for ((i=0; i<\${#args[@]}; i++)); do
-  if [[ "\${args[i]}" == "-p" || "\${args[i]}" == "--profile" ]]; then
-    if (( i + 1 < \${#args[@]} )); then
-      role_profile="\${args[i+1]}"
-    fi
-  fi
-  if [[ "\${args[i]}" == "-C" || "\${args[i]}" == "--cd" ]]; then
-    if (( i + 1 < \${#args[@]} )); then
-      agent_cwd="\${args[i+1]}"
-    fi
-  fi
-done
-
-if [[ -z "\$agent_cwd" ]]; then
-  agent_cwd="\$(pwd)"
-fi
-if [[ -z "\$agent_name" ]]; then
-  base_name="\$(basename "\$agent_cwd")"
-  if [[ "\$role_profile" == "\$DIRECTOR_PROFILE_VALUE" ]]; then
-    agent_name="\$TEAM_LEAD_NAME_VALUE"
-    agent_role="lead"
-  elif [[ "\$role_profile" == "\$WORKER_PROFILE_VALUE" ]]; then
-    if [[ "\$base_name" =~ ^worker-[0-9]+$ ]]; then
-      agent_name="\$base_name"
-    else
-      agent_name="worker-agent"
-    fi
-    agent_role="worker"
-  else
-    agent_name="agent"
-  fi
-fi
-
-notify_status() {
-  local body="\$1"
-  python3 "\$BUS_SCRIPT" --db "\$DB_PATH" register --room "\$ROOM_NAME" --agent "\$agent_name" --role "\$agent_role" >/dev/null 2>&1 || true
-  python3 "\$BUS_SCRIPT" --db "\$DB_PATH" send --room "\$ROOM_NAME" --from "\$agent_name" --to all --kind status --body "\$body" >/dev/null 2>&1 || true
-  python3 "\$FS_SCRIPT" dispatch --repo "\$REPO_PATH" --session "\$SESSION_NAME" --type status --from "\$agent_name" --recipient "\$TEAM_LEAD_NAME_VALUE" --content "\$body" --summary "runtime-status" >/dev/null 2>&1 || true
-}
-
-python3 "\$FS_SCRIPT" runtime-mark --repo "\$REPO_PATH" --session "\$SESSION_NAME" --agent "\$agent_name" --status running --pid "\$\$" >/dev/null 2>&1 || true
-notify_status "online backend=tmux permission_mode=\$PERMISSION_MODE_VALUE profile=\${role_profile:-default} cwd=\$agent_cwd pid=\$\$"
-
-cmd=("\$CODEX_BIN_VALUE")
-if [[ -n "\${CODEX_TEAM_MODEL:-}" ]]; then
-  cmd+=(-m "\$CODEX_TEAM_MODEL")
-elif [[ -n "\$DEFAULT_MODEL_VALUE" ]]; then
-  cmd+=(-m "\$DEFAULT_MODEL_VALUE")
-fi
-
-set +e
-"\${cmd[@]}" "\${args[@]}"
-exit_code=\$?
-set -e
-
-python3 "\$FS_SCRIPT" runtime-mark --repo "\$REPO_PATH" --session "\$SESSION_NAME" --agent "\$agent_name" --status terminated --pid "\$\$" >/dev/null 2>&1 || true
-notify_status "offline backend=tmux exit=\$exit_code cwd=\$agent_cwd"
-exit "\$exit_code"
-__WRAPPER__
-  chmod +x "$WRAPPER"
-}
-
-make_pane_command() {
-  local agent="$1"
-  local role="$2"
-  local profile="$3"
-  local cwd="$4"
-  local model="${5:-}"
-  local initial_prompt="${6:-}"
-  local cmd
-  printf -v cmd 'CODEX_TEAM_AGENT=%q CODEX_TEAM_ROLE=%q CODEX_TEAM_MODEL=%q %q -p %q -C %q' "$agent" "$role" "$model" "$WRAPPER" "$profile" "$cwd"
-  if [[ -n "$initial_prompt" ]]; then
-    local quoted_prompt
-    printf -v quoted_prompt '%q' "$initial_prompt"
-    cmd+=" $quoted_prompt"
-  fi
-  printf '%s\n' "$cmd"
-}
-
-boot_prompt_available() {
-  local agent="$1"
-  [[ -n "${BOOT_PROMPT_BY_AGENT[$agent]+x}" && -n "${BOOT_PROMPT_BY_AGENT[$agent]}" ]]
-}
-
-agent_boot_prompt() {
-  local agent="$1"
-  if boot_prompt_available "$agent"; then
-    printf '%s\n' "${BOOT_PROMPT_BY_AGENT[$agent]}"
-  fi
-}
-
-record_tmux_runtime() {
-  local agent="$1"
-  local pane_id="$2"
-  local window_name="$3"
-  fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --backend tmux --status running --pane-id "$pane_id" --window "$window_name" >/dev/null
-}
-
-set_tmux_pane_color() {
-  local pane_target="$1"
-  local agent="$2"
-  local color
-  color="$(fs_member_color "$agent")"
-  local border
-  border="$(fs_cmd color-map --color "$color" 2>/dev/null || echo default)"
-  tmux select-pane -t "$pane_target" -P "pane-border-style=fg=$border" >/dev/null 2>&1 || true
-  tmux select-pane -t "$pane_target" -P "pane-active-border-style=fg=$border" >/dev/null 2>&1 || true
-}
-
 spawn_detached_to_log() {
   local log_file="$1"
   shift
@@ -1491,193 +1275,6 @@ show_process_failure_hint() {
   if [[ -f "$log_file" ]]; then
     tail -n 60 "$log_file" >&2 || true
   fi
-}
-
-launch_tmux_split_backend() {
-  if [[ "${#TEAM_AGENT_NAMES[@]}" -lt 1 ]]; then
-    abort "no runtime agents configured"
-  fi
-  if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-    if [[ "$KILL_EXISTING_SESSION" == "true" ]]; then
-      tmux kill-session -t "$TMUX_SESSION"
-    else
-      echo "tmux session already exists: $TMUX_SESSION"
-      if [[ "$NO_ATTACH" != "true" ]]; then
-        tmux attach -t "$TMUX_SESSION"
-      fi
-      return 0
-    fi
-  fi
-
-  local first_agent="${TEAM_AGENT_NAMES[0]}"
-  local first_path="$WORKTREES_ROOT/$first_agent"
-  if [[ ! -d "$first_path" ]]; then
-    abort "missing worktree: $first_path"
-  fi
-
-  tmux new-session -d -s "$TMUX_SESSION" -n "$SWARM_WINDOW" -c "$first_path"
-  tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
-  tmux set-option -t "$TMUX_SESSION" -g pane-border-status top >/dev/null 2>&1 || true
-  tmux set-option -t "$TMUX_SESSION" -g pane-border-format '#{pane_title}' >/dev/null 2>&1 || true
-
-  tmux select-pane -t "$TMUX_SESSION:$SWARM_WINDOW.0" -T "$first_agent"
-  local first_role="${TEAM_AGENT_ROLE[$first_agent]}"
-  local first_profile="${TEAM_AGENT_PROFILE[$first_agent]}"
-  local first_model="${TEAM_AGENT_MODEL[$first_agent]}"
-  local first_boot_prompt
-  first_boot_prompt="$(agent_boot_prompt "$first_agent")"
-  local first_cmd
-  first_cmd="$(make_pane_command "$first_agent" "$first_role" "$first_profile" "$first_path" "$first_model" "$first_boot_prompt")"
-  tmux send-keys -t "$TMUX_SESSION:$SWARM_WINDOW.0" "$first_cmd" C-m
-  local first_pane
-  first_pane="$(tmux display-message -p -t "$TMUX_SESSION:$SWARM_WINDOW.0" '#{pane_id}')"
-  record_tmux_runtime "$first_agent" "$first_pane" "$SWARM_WINDOW"
-  set_tmux_pane_color "$TMUX_SESSION:$SWARM_WINDOW.0" "$first_agent"
-
-  local idx agent
-  for ((idx=1; idx<${#TEAM_AGENT_NAMES[@]}; idx++)); do
-    agent="${TEAM_AGENT_NAMES[$idx]}"
-    local wt_path="$WORKTREES_ROOT/$agent"
-    local role="${TEAM_AGENT_ROLE[$agent]}"
-    local profile="${TEAM_AGENT_PROFILE[$agent]}"
-    local model="${TEAM_AGENT_MODEL[$agent]}"
-    if [[ ! -d "$wt_path" ]]; then
-      echo "skip missing worktree: $wt_path" >&2
-      continue
-    fi
-
-    local pane_id
-    pane_id="$(tmux split-window -P -F '#{pane_id}' -t "$TMUX_SESSION:$SWARM_WINDOW" -c "$wt_path")"
-    tmux select-pane -t "$pane_id" -T "$agent"
-
-    local worker_cmd
-    local worker_boot_prompt
-    worker_boot_prompt="$(agent_boot_prompt "$agent")"
-    worker_cmd="$(make_pane_command "$agent" "$role" "$profile" "$wt_path" "$model" "$worker_boot_prompt")"
-    tmux send-keys -t "$pane_id" "$worker_cmd" C-m
-
-    record_tmux_runtime "$agent" "$pane_id" "$SWARM_WINDOW"
-    set_tmux_pane_color "$pane_id" "$agent"
-
-    tmux select-layout -t "$TMUX_SESSION:$SWARM_WINDOW" tiled >/dev/null 2>&1 || true
-  done
-
-  tmux select-layout -t "$TMUX_SESSION:$SWARM_WINDOW" tiled >/dev/null 2>&1 || true
-  tmux select-pane -t "$TMUX_SESSION:$SWARM_WINDOW.0"
-}
-
-launch_tmux_window_backend() {
-  if [[ "${#TEAM_AGENT_NAMES[@]}" -lt 1 ]]; then
-    abort "no runtime agents configured"
-  fi
-  if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-    if [[ "$KILL_EXISTING_SESSION" == "true" ]]; then
-      tmux kill-session -t "$TMUX_SESSION"
-    else
-      echo "tmux session already exists: $TMUX_SESSION"
-      if [[ "$NO_ATTACH" != "true" ]]; then
-        tmux attach -t "$TMUX_SESSION"
-      fi
-      return 0
-    fi
-  fi
-
-  local first_agent="${TEAM_AGENT_NAMES[0]}"
-  local first_path="$WORKTREES_ROOT/$first_agent"
-  if [[ ! -d "$first_path" ]]; then
-    abort "missing worktree: $first_path"
-  fi
-
-  tmux new-session -d -s "$TMUX_SESSION" -n "$first_agent" -c "$first_path"
-  tmux set-option -t "$TMUX_SESSION" -g remain-on-exit on >/dev/null 2>&1 || true
-  local first_role="${TEAM_AGENT_ROLE[$first_agent]}"
-  local first_profile="${TEAM_AGENT_PROFILE[$first_agent]}"
-  local first_model="${TEAM_AGENT_MODEL[$first_agent]}"
-  local first_boot_prompt
-  first_boot_prompt="$(agent_boot_prompt "$first_agent")"
-  local first_cmd
-  first_cmd="$(make_pane_command "$first_agent" "$first_role" "$first_profile" "$first_path" "$first_model" "$first_boot_prompt")"
-  tmux send-keys -t "$TMUX_SESSION:$first_agent.0" "$first_cmd" C-m
-  local first_pane
-  first_pane="$(tmux display-message -p -t "$TMUX_SESSION:$first_agent.0" '#{pane_id}')"
-  record_tmux_runtime "$first_agent" "$first_pane" "$first_agent"
-  tmux select-pane -t "$TMUX_SESSION:$first_agent.0" -T "$first_agent"
-  set_tmux_pane_color "$TMUX_SESSION:$first_agent.0" "$first_agent"
-
-  local idx agent
-  for ((idx=1; idx<${#TEAM_AGENT_NAMES[@]}; idx++)); do
-    agent="${TEAM_AGENT_NAMES[$idx]}"
-    local wt_path="$WORKTREES_ROOT/$agent"
-    local role="${TEAM_AGENT_ROLE[$agent]}"
-    local profile="${TEAM_AGENT_PROFILE[$agent]}"
-    local model="${TEAM_AGENT_MODEL[$agent]}"
-    if [[ ! -d "$wt_path" ]]; then
-      echo "skip missing worktree: $wt_path" >&2
-      continue
-    fi
-    tmux new-window -t "$TMUX_SESSION" -n "$agent" -c "$wt_path"
-    local worker_cmd
-    local worker_boot_prompt
-    worker_boot_prompt="$(agent_boot_prompt "$agent")"
-    worker_cmd="$(make_pane_command "$agent" "$role" "$profile" "$wt_path" "$model" "$worker_boot_prompt")"
-    tmux send-keys -t "$TMUX_SESSION:$agent.0" "$worker_cmd" C-m
-    local pane_id
-    pane_id="$(tmux display-message -p -t "$TMUX_SESSION:$agent.0" '#{pane_id}')"
-    record_tmux_runtime "$agent" "$pane_id" "$agent"
-    tmux select-pane -t "$TMUX_SESSION:$agent.0" -T "$agent"
-    set_tmux_pane_color "$TMUX_SESSION:$agent.0" "$agent"
-  done
-
-  tmux select-window -t "$TMUX_SESSION:$first_agent"
-}
-
-spawn_inprocess_backend() {
-  mkdir -p "$LOG_DIR"
-
-  local inprocess_agents=("${TEAM_AGENT_NAMES[@]}")
-  local agent
-  for agent in "${inprocess_agents[@]}"; do
-    local wt_path="$WORKTREES_ROOT/$agent"
-    local role="${TEAM_AGENT_ROLE[$agent]}"
-    local profile="${TEAM_AGENT_PROFILE[$agent]}"
-    local model="${TEAM_AGENT_MODEL[$agent]}"
-    if [[ ! -d "$wt_path" ]]; then
-      echo "skip missing worktree: $wt_path" >&2
-      continue
-    fi
-
-    local log_file="$LOG_DIR/$agent.log"
-    local args=(
-      python3 "$INPROCESS_AGENT"
-      --repo "$REPO"
-      --session "$TMUX_SESSION"
-      --room "$ROOM"
-      --agent "$agent"
-      --role "$role"
-      --cwd "$wt_path"
-      --profile "$profile"
-      --model "$model"
-      --codex-bin "$CODEX_BIN"
-      --poll-ms "$INPROCESS_POLL_MS"
-      --idle-ms "$INPROCESS_IDLE_MS"
-      --permission-mode "$PERMISSION_MODE"
-    )
-    if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
-      args+=(--plan-mode-required)
-    fi
-
-    local pid
-    pid="$(spawn_detached_to_log "$log_file" "${args[@]}")"
-
-    fs_cmd runtime-set --repo "$REPO" --session "$TMUX_SESSION" --agent "$agent" --backend in-process --status running --pid "$pid" --window in-process >/dev/null
-    python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "$agent" --role "$role" >/dev/null
-    python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind status --body "spawned in-process agent=$agent pid=$pid log=$log_file" >/dev/null
-
-    if ! process_alive "$pid"; then
-      python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind blocker \
-        --body "in-process agent exited immediately agent=$agent pid=$pid log=$log_file" >/dev/null || true
-    fi
-  done
 }
 
 spawn_inprocess_shared_backend() {
@@ -1754,56 +1351,6 @@ spawn_inprocess_shared_backend() {
   abort "in-process shared hub failed startup stability check (${INPROCESS_SHARED_STABILIZE_SEC}s, attempts=$max_attempts). check: $hub_log $hub_lifecycle"
 }
 
-launch_aux_windows() {
-  if [[ "$RESOLVED_BACKEND" != "tmux" ]]; then
-    return 0
-  fi
-
-  if window_exists "$TMUX_SESSION" "$MONITOR_WINDOW"; then
-    tmux send-keys -t "$TMUX_SESSION:$MONITOR_WINDOW" C-c >/dev/null 2>&1 || true
-  else
-    tmux new-window -t "$TMUX_SESSION" -n "$MONITOR_WINDOW" -c "$REPO"
-  fi
-  tmux select-pane -t "$TMUX_SESSION:$MONITOR_WINDOW.0" -T "monitor" >/dev/null 2>&1 || true
-  tmux send-keys -t "$TMUX_SESSION:$MONITOR_WINDOW" "TEAM_DB='$DB' '$TAIL_SCRIPT' --room '$ROOM' --all monitor" C-m
-
-  if [[ "$DASHBOARD" == "true" ]]; then
-    if window_exists "$TMUX_SESSION" "$DASHBOARD_WINDOW"; then
-      tmux send-keys -t "$TMUX_SESSION:$DASHBOARD_WINDOW" C-c >/dev/null 2>&1 || true
-    else
-      tmux new-window -t "$TMUX_SESSION" -n "$DASHBOARD_WINDOW" -c "$REPO"
-    fi
-    tmux select-pane -t "$TMUX_SESSION:$DASHBOARD_WINDOW.0" -T "dashboard" >/dev/null 2>&1 || true
-    tmux send-keys -t "$TMUX_SESSION:$DASHBOARD_WINDOW" \
-      "TEAM_DB='$DB' '$DASHBOARD_SCRIPT' --session '$TMUX_SESSION' --repo '$REPO' --room '$ROOM' --lines '$DASHBOARD_LINES' --messages '$DASHBOARD_MESSAGES'" C-m
-  fi
-
-  if parse_bool_env "$ENABLE_TMUX_PULSE"; then
-    if window_exists "$TMUX_SESSION" "$PULSE_WINDOW"; then
-      tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" C-c >/dev/null 2>&1 || true
-    else
-      tmux new-window -t "$TMUX_SESSION" -n "$PULSE_WINDOW" -c "$REPO"
-    fi
-    tmux select-pane -t "$TMUX_SESSION:$PULSE_WINDOW.0" -T "pulse" >/dev/null 2>&1 || true
-    local pulse_agents
-    pulse_agents="$(IFS=,; echo "${TEAM_AGENT_NAMES[*]}")"
-    tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" \
-      "TEAM_DB='$DB' '$PULSE_SCRIPT' --session '$TMUX_SESSION' --window '$SWARM_WINDOW' --room '$ROOM' --agents-csv '$pulse_agents' --lead-name '$TEAM_LEAD_NAME'" C-m
-  elif window_exists "$TMUX_SESSION" "$PULSE_WINDOW"; then
-    tmux send-keys -t "$TMUX_SESSION:$PULSE_WINDOW" C-c >/dev/null 2>&1 || true
-    tmux kill-window -t "$TMUX_SESSION:$PULSE_WINDOW" >/dev/null 2>&1 || true
-  fi
-
-  if window_exists "$TMUX_SESSION" "$MAILBOX_WINDOW"; then
-    tmux send-keys -t "$TMUX_SESSION:$MAILBOX_WINDOW" C-c >/dev/null 2>&1 || true
-  else
-    tmux new-window -t "$TMUX_SESSION" -n "$MAILBOX_WINDOW" -c "$REPO"
-  fi
-  tmux select-pane -t "$TMUX_SESSION:$MAILBOX_WINDOW.0" -T "mailbox-bridge" >/dev/null 2>&1 || true
-  tmux send-keys -t "$TMUX_SESSION:$MAILBOX_WINDOW" \
-    "python3 '$TMUX_MAILBOX_BRIDGE' --repo '$REPO' --session '$TMUX_SESSION' --room '$ROOM' --tmux-session '$TMUX_SESSION' --lead-name '$TEAM_LEAD_NAME' --auto-kill-done-workers '$AUTO_KILL_DONE_WORKER_TMUX' --poll-ms '$TMUX_MAILBOX_POLL_MS'" C-m
-}
-
 role_primary_objective() {
   local role="$1"
   case "$role" in
@@ -1849,8 +1396,8 @@ $user_task
 
 Execution contract:
 1. Start immediately and keep changes scoped to your role responsibility.
-2. Lead($TEAM_LEAD_NAME) owns research/planning/review orchestration and must not execute implementation tasks. Escalate blockers/questions to lead.
-3. Realtime collaboration is mandatory and continuous: when interfaces/requirements are unclear, ask $peer with \`question\`, reply with \`answer\`, and keep iterative loops until closed.
+2. Lead($TEAM_LEAD_NAME) owns research/planning/review orchestration. Escalate blockers/questions to lead quickly with concrete options.
+3. Realtime collaboration is mandatory and continuous: when interfaces/requirements are unclear, ask $peer and lead with \`question\`, reply with \`answer\`, and keep iterative loops until closed.
 4. Send progress and completion updates:
    codex-teams sendmessage --session "$TMUX_SESSION" --room "$ROOM" --type status --from "$agent" --to "$TEAM_LEAD_NAME" --summary "<progress|done|blocker>" --content "<update>"
 5. Include evidence in done: changed files + validation command outputs + residual risk.
@@ -1873,13 +1420,14 @@ Operating policy:
 2. Produce a concrete execution plan.
 3. Operate fixed runtime topology: worker-1, worker-2, worker-3 (no worker scaling).
 4. Delegate implementation tasks to worker-* agents.
-5. Mailbox reads are mention-driven: react when teammate mentions/updates arrive instead of blind polling loops.
-6. Worker completion is worker-declared: treat worker \`status\` summary \`done\` as completion signal for that worker scope.
-7. Start final lead review only after all worker-* scopes are reported done.
-8. If review finds follow-up work, either delegate additional tasks to worker-* or directly implement targeted fixes yourself.
-9. Assign one worker for final git push/merge workflow after review approval.
-10. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
-11. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
+5. Active feedback loop is mandatory: for every worker status/blocker/question, send explicit feedback with next action, priority, and owner.
+6. Mailbox reads are mention-driven: react when teammate mentions/updates arrive instead of blind polling loops.
+7. Worker completion is worker-declared: treat worker \`status\` summary \`done\` as completion signal for that worker scope.
+8. Start final lead review only after all worker-* scopes are reported done.
+9. If review finds follow-up work, either delegate additional tasks to worker-* or directly implement targeted fixes yourself.
+10. Assign one worker for final git push/merge workflow after review approval.
+11. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
+12. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
 EOF
 }
 
@@ -1905,21 +1453,9 @@ prepare_initial_boot_prompts() {
 
 announce_collaboration_workflow() {
   local workflow_summary
-  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(continuous)->on-demand-research-by-lead->lead-review->assigned-worker-push/merge; lead=orchestration-only(external-session); unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=fixed-worker-pool-3"
+  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(continuous)->on-demand-research-by-lead->feedback-loop(lead<->workers)->lead-review->assigned-worker-push/merge; lead=orchestration-only(external-session); unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=fixed-worker-pool-3"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status --body "$workflow_summary" >/dev/null
   fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from orchestrator --recipient all --summary "workflow-fixed" --content "$workflow_summary" >/dev/null || true
-}
-
-tmux_send_worker_task() {
-  local agent="$1"
-  local prompt="$2"
-  local pane
-  pane="$(runtime_read_field "$agent" paneId)"
-  if [[ -z "$pane" ]]; then
-    return 0
-  fi
-  tmux send-keys -t "$pane" -l -- "$prompt"
-  tmux send-keys -t "$pane" C-m
 }
 
 delegate_initial_task_to_role_agents() {
@@ -1934,11 +1470,6 @@ delegate_initial_task_to_role_agents() {
     delegated="$(build_role_task_prompt "$agent" "$role" "$i" "$total" "$task_text")"
     fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from "$TEAM_LEAD_NAME" --recipient "$agent" --content "$delegated" --summary "delegated-initial-task-$agent" >/dev/null
     python3 "$BUS" --db "$DB" send --room "$ROOM" --from "$TEAM_LEAD_NAME" --to "$agent" --kind task --body "$delegated" >/dev/null
-    if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
-      if ! boot_prompt_available "$agent"; then
-        tmux_send_worker_task "$agent" "$delegated" || true
-      fi
-    fi
   done
 }
 
@@ -1970,13 +1501,6 @@ print_start_summary() {
   if [[ -n "$NORMALIZED_TEAMMATE_MODE" ]]; then
     echo "- backend request normalized: $NORMALIZED_TEAMMATE_MODE"
   fi
-  if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
-    echo "- tmux layout: $TMUX_LAYOUT"
-    echo "- tmux mailbox bridge window: $MAILBOX_WINDOW"
-    echo "- tmux mailbox bridge poll(ms): $TMUX_MAILBOX_POLL_MS"
-    echo "- tmux pulse enabled: $ENABLE_TMUX_PULSE"
-    echo "- tmux auto-kill done worker: $AUTO_KILL_DONE_WORKER_TMUX"
-  fi
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
   local runtime_members="${#TEAM_AGENT_NAMES[@]}"
   echo "- role members: $total_members ($TEAM_ROLE_SUMMARY)"
@@ -1994,19 +1518,11 @@ print_start_summary() {
   if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" ]]; then
     echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>}"
   fi
-  if [[ "$RESOLVED_BACKEND" == "in-process" ]]; then
-    echo "- logs: $LOG_DIR/<agent>.log"
-  elif [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
-    echo "- logs: $LOG_DIR/inprocess-hub.log"
-  fi
-  if [[ "$RESOLVED_BACKEND" == "in-process" || "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
-    echo "- in-process poll(ms): $INPROCESS_POLL_MS"
-    echo "- in-process idle(ms): $INPROCESS_IDLE_MS"
-  fi
-  if [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
-    echo "- shared startup stabilize(sec): $INPROCESS_SHARED_STABILIZE_SEC"
-    echo "- shared startup retries: $INPROCESS_SHARED_START_RETRIES"
-  fi
+  echo "- logs: $LOG_DIR/inprocess-hub.log"
+  echo "- in-process poll(ms): $INPROCESS_POLL_MS"
+  echo "- in-process idle(ms): $INPROCESS_IDLE_MS"
+  echo "- shared startup stabilize(sec): $INPROCESS_SHARED_STABILIZE_SEC"
+  echo "- shared startup retries: $INPROCESS_SHARED_START_RETRIES"
   echo "- command lock wait(sec): $SESSION_LOCK_WAIT_SEC"
   echo "- status: TEAM_DB='$DB' '$STATUS' --room '$ROOM'"
   echo "- mailbox: TEAM_DB='$DB' '$MAILBOX' --repo '$REPO' --session '$TMUX_SESSION' inbox <agent> --unread"
@@ -2039,7 +1555,7 @@ for record in agents.values():
     if str(record.get("status", "")) != "running":
         continue
     backend = str(record.get("backend", ""))
-    if backend not in {"in-process", "in-process-shared"}:
+    if backend != "in-process-shared":
         continue
     pid = int(record.get("pid", 0) or 0)
     if pid <= 0:
@@ -2055,14 +1571,14 @@ PY
 }
 
 guard_existing_inprocess_runtime() {
-  if [[ "$RESOLVED_BACKEND" != "in-process" && "$RESOLVED_BACKEND" != "in-process-shared" ]]; then
+  if [[ "$RESOLVED_BACKEND" != "in-process-shared" ]]; then
     return 0
   fi
 
   local alive_count
   alive_count="$(count_alive_runtime_processes)"
   if [[ "$alive_count" =~ ^[0-9]+$ ]] && [[ "$alive_count" -gt 0 ]]; then
-    abort "active in-process runtime already exists for session '$TMUX_SESSION' (alive=$alive_count). use status/teamdelete --force first."
+    abort "active in-process-shared runtime already exists for session '$TMUX_SESSION' (alive=$alive_count). use status/teamdelete --force first."
   fi
 }
 
@@ -2083,37 +1599,18 @@ run_swarm() {
   create_or_refresh_team_context true
 
   prepare_initial_boot_prompts
-  if [[ "$RESOLVED_BACKEND" == "tmux" ]]; then
-    require_cmd tmux
-    make_wrapper
-    if [[ "$TMUX_LAYOUT" == "split" ]]; then
-      launch_tmux_split_backend
-    else
-      launch_tmux_window_backend
-    fi
-    launch_aux_windows
-  else
-    if [[ "$RESOLVED_BACKEND" == "in-process-shared" ]]; then
-      spawn_inprocess_shared_backend
-    else
-      spawn_inprocess_backend
-    fi
-  fi
+  spawn_inprocess_shared_backend
 
-  write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
+  write_viewer_bridge "$RESOLVED_BACKEND" "shared"
 
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
   local runtime_members="${#TEAM_AGENT_NAMES[@]}"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from system --to all --kind system \
-    --body "session=$TMUX_SESSION started via codex-teams backend=$RESOLVED_BACKEND members=$total_members runtime_members=$runtime_members lead_mode=external role_shape=[$TEAM_ROLE_SUMMARY] layout=$TMUX_LAYOUT permission_mode=$PERMISSION_MODE" >/dev/null
+    --body "session=$TMUX_SESSION started via codex-teams backend=$RESOLVED_BACKEND members=$total_members runtime_members=$runtime_members lead_mode=external role_shape=[$TEAM_ROLE_SUMMARY] layout=shared permission_mode=$PERMISSION_MODE" >/dev/null
   announce_collaboration_workflow
 
   inject_initial_task
   print_start_summary
-
-  if [[ "$RESOLVED_BACKEND" == "tmux" && "$NO_ATTACH" != "true" ]]; then
-    tmux attach -t "$TMUX_SESSION"
-  fi
 }
 
 run_status() {
@@ -2185,15 +1682,6 @@ PY
     fi
   fi
 
-  if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-    echo ""
-    echo "[tmux panes]"
-    tmux list-panes -s -t "$TMUX_SESSION" -F "session=#{session_name} window=#{window_name} pane=#{pane_index} title=#{pane_title} cmd=#{pane_current_command} path=#{pane_current_path}"
-  else
-    echo ""
-    echo "tmux session not running: $TMUX_SESSION"
-  fi
-
   if [[ -f "$DB" ]]; then
     echo ""
     TEAM_DB="$DB" "$STATUS" --room "$ROOM"
@@ -2235,19 +1723,7 @@ apply_shutdown_target() {
   local window
   window="$(runtime_read_field "$target" window)"
 
-  if [[ "$backend" == "tmux" && -n "$pane" ]]; then
-    if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-      tmux kill-pane -t "$pane" >/dev/null 2>&1 || true
-    fi
-    fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
-  elif [[ "$backend" == "tmux" && -n "$window" ]]; then
-    if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-      tmux kill-window -t "$TMUX_SESSION:$window" >/dev/null 2>&1 || true
-    fi
-    fs_cmd runtime-mark --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --status terminated >/dev/null || true
-  elif [[ "$backend" == "in-process" ]]; then
-    fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --signal term >/dev/null || true
-  elif [[ "$backend" == "in-process-shared" ]]; then
+  if [[ "$backend" == "in-process-shared" ]]; then
     if [[ "$target" == "$INPROCESS_HUB_AGENT" ]]; then
       fs_cmd runtime-kill --repo "$REPO" --session "$TMUX_SESSION" --agent "$target" --signal term >/dev/null || true
     else
@@ -2343,7 +1819,7 @@ cmd_teamcreate() {
   acquire_session_lock
   init_bus_and_dirs
   create_or_refresh_team_context "$TEAMCREATE_REPLACE"
-  write_viewer_bridge "$RESOLVED_BACKEND" "$TMUX_LAYOUT"
+  write_viewer_bridge "$RESOLVED_BACKEND" "shared"
   echo "team context ready"
   echo "- config: $TEAM_CONFIG"
   echo "- bus: $DB"
@@ -2381,7 +1857,7 @@ USE_BASE_WIP="false"
 # true: allow dirty tree without snapshot (workers start from BASE_REF only).
 ALLOW_DIRTY="true"
 
-# tmux session options.
+# Session options.
 TMUX_SESSION="codex-fleet"
 KILL_EXISTING_SESSION="false"
 
@@ -2395,14 +1871,10 @@ MERGE_STRATEGY="merge"
 
 # Backend default (resource-lean shared supervisor).
 TEAMMATE_MODE="in-process-shared"
-TMUX_LAYOUT="split"
 PERMISSION_MODE="default"
 PLAN_MODE_REQUIRED="false"
 AUTO_DELEGATE="true"
-AUTO_KILL_DONE_WORKER_TMUX="true"
-ENABLE_TMUX_PULSE="false"
-TMUX_MAILBOX_POLL_MS="1500"
-INPROCESS_POLL_MS="1000"
+INPROCESS_POLL_MS="250"
 INPROCESS_IDLE_MS="12000"
 INPROCESS_SHARED_STABILIZE_SEC="12"
 INPROCESS_SHARED_START_RETRIES="1"
@@ -2441,7 +1913,6 @@ cmd_deps() {
     "wslpath|required"
     "codex|required"
     "sqlite3|optional"
-    "tmux|optional"
   )
 
   for spec in "${deps[@]}"; do
@@ -2633,14 +2104,6 @@ cmd_teamdelete() {
 
   if [[ "$DELETE_FORCE" == "true" ]]; then
     force_terminate_runtime_agents
-  fi
-
-  if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-    if [[ "$DELETE_FORCE" == "true" ]]; then
-      tmux kill-session -t "$TMUX_SESSION"
-    else
-      abort "tmux session is active ($TMUX_SESSION). stop it first or use --force"
-    fi
   fi
 
   local force_arg=()
@@ -3015,24 +2478,10 @@ parse_args() {
         shift 2
         ;;
       --dashboard)
-        DASHBOARD="true"
-        shift
+        abort "--dashboard is not supported: runtime is in-process-shared only"
         ;;
-      --dashboard-window)
-        DASHBOARD_WINDOW="$2"
-        shift 2
-        ;;
-      --dashboard-lines)
-        DASHBOARD_LINES="$2"
-        shift 2
-        ;;
-      --dashboard-messages)
-        DASHBOARD_MESSAGES="$2"
-        shift 2
-        ;;
-      --no-attach)
-        NO_ATTACH="true"
-        shift
+      --dashboard-window|--dashboard-lines|--dashboard-messages)
+        abort "$1 is not supported: runtime is in-process-shared only"
         ;;
       --team-name)
         TEAM_NAME_OVERRIDE="$2"
@@ -3071,9 +2520,7 @@ parse_args() {
         shift 2
         ;;
       --tmux-layout)
-        TMUX_LAYOUT="$2"
-        TMUX_LAYOUT_OVERRIDE="$2"
-        shift 2
+        abort "--tmux-layout is not supported: runtime is in-process-shared only"
         ;;
       --permission-mode)
         PERMISSION_MODE="$2"
@@ -3192,14 +2639,7 @@ parse_args() {
     CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
   fi
 
-  if ! [[ "$DASHBOARD_LINES" =~ ^[0-9]+$ ]] || [[ "$DASHBOARD_LINES" -lt 1 ]]; then
-    abort "--dashboard-lines must be >= 1"
-  fi
-  if ! [[ "$DASHBOARD_MESSAGES" =~ ^[0-9]+$ ]] || [[ "$DASHBOARD_MESSAGES" -lt 1 ]]; then
-    abort "--dashboard-messages must be >= 1"
-  fi
-  case "$TEAMMATE_MODE" in auto|tmux|in-process|in-process-shared) ;; *) abort "--teammate-mode must be auto|tmux|in-process|in-process-shared" ;; esac
-  case "$TMUX_LAYOUT" in split|window) ;; *) abort "--tmux-layout must be split|window" ;; esac
+  case "$TEAMMATE_MODE" in auto|in-process-shared) ;; *) abort "--teammate-mode must be in-process-shared (auto alias allowed)" ;; esac
 }
 
 main() {
