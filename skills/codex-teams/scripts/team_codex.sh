@@ -1832,6 +1832,7 @@ build_role_task_prompt() {
 7. Maintain continuous peer collaboration: when your output depends on another worker, send \`question\` and keep Q/A looping until dependency is closed.
 8. If anything is unknown mid-task, ask lead immediately with \`question\` (summary: research-request); do not guess critical requirements.
 9. If lead assigns merge/release ownership, execute it using configured git binary: \`"$GIT_BIN"\`.
+10. You decide completion for your assigned scope. When you judge it done, explicitly send \`status\` with summary \`done\` to lead and include changed files + validation evidence.
 EOF
 )"
   fi
@@ -1872,13 +1873,13 @@ Operating policy:
 2. Produce a concrete execution plan.
 3. Operate fixed runtime topology: worker-1, worker-2, worker-3 (no worker scaling).
 4. Delegate implementation tasks to worker-* agents.
-5. Coordinate in real time, intervene on blockers, and keep worker-to-worker collaboration loops active until resolution.
-6. Assign one worker for final git push/merge workflow after review approval.
-7. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
-8. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
-
-Hard constraint:
-- Do not implement code directly; lead is orchestration-only.
+5. Mailbox reads are mention-driven: react when teammate mentions/updates arrive instead of blind polling loops.
+6. Worker completion is worker-declared: treat worker \`status\` summary \`done\` as completion signal for that worker scope.
+7. Start final lead review only after all worker-* scopes are reported done.
+8. If review finds follow-up work, either delegate additional tasks to worker-* or directly implement targeted fixes yourself.
+9. Assign one worker for final git push/merge workflow after review approval.
+10. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
+11. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
 EOF
 }
 

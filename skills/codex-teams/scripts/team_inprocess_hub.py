@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,6 +29,9 @@ import team_inprocess_agent as agent_loop  # noqa: E402
 
 STOP = False
 STOP_SIGNAL = ""
+DONE_KEYWORDS = {"done", "complete", "completed", "finish", "finished", "resolved", "fixed"}
+DONE_NEGATIVE_MARKERS = {"not done", "in progress", "wip", "todo", "incomplete"}
+MAX_CAPTURE_BYTES = 200_000
 
 
 @dataclass
@@ -40,9 +44,12 @@ class WorkerState:
     last_activity: int = 0
     last_idle_sent: int = 0
     last_mention_token: int = 0
-    force_mailbox_check: bool = True
+    force_mailbox_check: bool = False
     active_proc: subprocess.Popen[str] | None = None
     active_started_ms: int = 0
+    active_output_chunks: list[str] = field(default_factory=list)
+    active_output_bytes: int = 0
+    active_output_truncated: bool = False
     stopped: bool = False
 
 
@@ -80,6 +87,11 @@ def spawn_cmd(cmd: list[str], *, cwd: str) -> tuple[subprocess.Popen[str] | None
         )
     except OSError as exc:
         return None, f"failed to execute {' '.join(cmd)}: {exc}"
+    try:
+        if proc.stdout is not None:
+            os.set_blocking(proc.stdout.fileno(), False)
+    except OSError:
+        pass
     return proc, ""
 
 
@@ -143,6 +155,134 @@ def load_unread_messages(paths: team_fs.FsPaths, worker: WorkerState, *, limit: 
             continue
         rows.append({"index": idx, **row})
     return rows
+
+
+def load_unread_messages_no_mark(paths: team_fs.FsPaths, agent: str, *, limit: int) -> list[dict]:
+    try:
+        values = team_fs.mailbox_read_indexed(
+            paths,
+            agent,
+            unread=True,
+            limit=limit,
+            mark_read_selected=False,
+        )
+    except Exception:
+        return []
+
+    rows: list[dict] = []
+    for idx, row in values:
+        if not isinstance(row, dict):
+            continue
+        rows.append({"index": idx, **row})
+    return rows
+
+
+def text_indicates_done(raw: str) -> bool:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return False
+    for marker in DONE_NEGATIVE_MARKERS:
+        if marker in text:
+            return False
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", text) if tok]
+    if not tokens:
+        return False
+    return any(tok in DONE_KEYWORDS for tok in tokens)
+
+
+def worker_message_reports_done(message: dict) -> bool:
+    msg_type = str(message.get("type", "")).strip()
+    if msg_type in {"task", "question", "blocker", "shutdown_request"}:
+        return False
+    summary = str(message.get("summary", ""))
+    text = str(message.get("text", ""))
+    if text_indicates_done(summary):
+        return True
+    if msg_type in {"status", "message", "answer"} and text_indicates_done(text):
+        return True
+    return False
+
+
+def trim_seen_indexes(seen: set[int], *, keep: int = 6000) -> None:
+    if len(seen) <= keep:
+        return
+    max_idx = max(seen)
+    floor = max(0, max_idx - keep)
+    stale = [idx for idx in seen if idx < floor]
+    for idx in stale:
+        seen.discard(idx)
+
+
+def all_workers_review_ready(workers: list[WorkerState], worker_done: dict[str, bool]) -> bool:
+    if not worker_done:
+        return False
+    for worker in workers:
+        if worker.args.role != "worker" or worker.stopped:
+            continue
+        if not worker_done.get(worker.args.agent, False):
+            return False
+        if worker.active_proc is not None:
+            return False
+        if worker.pending_texts:
+            return False
+    return True
+
+
+def notify_review_ready(
+    *,
+    fs_path: Path,
+    bus_path: Path,
+    db_path: Path,
+    repo: str,
+    session: str,
+    room: str,
+    lead: str,
+    worker_done: dict[str, bool],
+) -> None:
+    done_workers = [name for name, done in worker_done.items() if done]
+    done_workers.sort()
+    body = (
+        "all worker-* agents reported task completion. "
+        f"ready for lead final review. workers={','.join(done_workers)} "
+        "if review finds follow-up work, delegate extra tasks or patch directly."
+    )
+    bus_cmd(
+        bus_path,
+        db_path,
+        [
+            "send",
+            "--room",
+            room,
+            "--from",
+            "system",
+            "--to",
+            lead,
+            "--kind",
+            "status",
+            "--body",
+            body,
+        ],
+    )
+    fs_cmd(
+        fs_path,
+        [
+            "dispatch",
+            "--repo",
+            repo,
+            "--session",
+            session,
+            "--type",
+            "status",
+            "--from",
+            "system",
+            "--recipient",
+            lead,
+            "--summary",
+            "review-ready",
+            "--content",
+            body,
+        ],
+    )
 
 
 def worker_online(bus_path: Path, db_path: Path, fs_path: Path, worker: WorkerState) -> None:
@@ -294,14 +434,43 @@ def publish_worker_result(
     worker.last_activity = now_ms()
 
 
-def collect_completed_output(proc: subprocess.Popen[str]) -> str:
-    out = ""
-    try:
-        if proc.stdout is not None:
-            out = proc.stdout.read()
-    except Exception:
-        out = ""
-    return out or ""
+def reset_worker_output_capture(worker: WorkerState) -> None:
+    worker.active_output_chunks = []
+    worker.active_output_bytes = 0
+    worker.active_output_truncated = False
+
+
+def drain_worker_output(worker: WorkerState) -> None:
+    proc = worker.active_proc
+    if proc is None or proc.stdout is None:
+        return
+    fd = proc.stdout.fileno()
+    while True:
+        try:
+            chunk = os.read(fd, 8192)
+        except BlockingIOError:
+            break
+        except OSError:
+            break
+        if not chunk:
+            break
+        if worker.active_output_bytes >= MAX_CAPTURE_BYTES:
+            worker.active_output_truncated = True
+            continue
+        remaining = MAX_CAPTURE_BYTES - worker.active_output_bytes
+        take = chunk[:remaining]
+        worker.active_output_bytes += len(take)
+        worker.active_output_chunks.append(take.decode("utf-8", errors="replace"))
+        if len(chunk) > remaining:
+            worker.active_output_truncated = True
+
+
+def collected_worker_output(worker: WorkerState) -> str:
+    out = "".join(worker.active_output_chunks).strip()
+    if worker.active_output_truncated:
+        suffix = "\n[output truncated]"
+        out = f"{out}{suffix}" if out else suffix.strip()
+    return out
 
 
 def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None:
@@ -321,9 +490,10 @@ def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None
                 proc.kill()
             except Exception:
                 pass
-    collect_completed_output(proc)
+    drain_worker_output(worker)
     worker.active_proc = None
     worker.active_started_ms = 0
+    reset_worker_output_capture(worker)
 
 
 def main() -> int:
@@ -436,7 +606,8 @@ def main() -> int:
                 cwd=cwd,
                 prompt_prefix=f"{prompt_base}\n**Your Identity:**\n- Name: {name}\n",
                 last_activity=now_ms(),
-                last_mention_token=team_fs.mailbox_signal_token(paths, name),
+                last_mention_token=0,
+                force_mailbox_check=False,
             )
         )
 
@@ -469,6 +640,12 @@ def main() -> int:
     for worker in workers:
         worker_online(bus_path, db_path, fs_path, worker)
 
+    worker_done: dict[str, bool] = {
+        worker.args.agent: False for worker in workers if worker.args.role == "worker"
+    }
+    review_ready_announced = False
+    lead_last_mention_token = 0
+    lead_seen_indexes: set[int] = set()
     last_heartbeat = 0
     while not STOP and any(not w.stopped for w in workers):
         for worker in workers:
@@ -513,6 +690,9 @@ def main() -> int:
                 )
                 if work_messages:
                     worker.last_activity = now_ms()
+                    if worker.args.role == "worker":
+                        worker_done[worker.args.agent] = False
+                        review_ready_announced = False
 
             if worker.pending_texts and worker.active_proc is None:
                 prompt = "\n".join(worker.pending_texts)
@@ -534,13 +714,19 @@ def main() -> int:
                     worker.active_proc = proc
                     worker.active_started_ms = now_ms()
                     worker.last_activity = worker.active_started_ms
+                    reset_worker_output_capture(worker)
+                    if worker.args.role == "worker":
+                        worker_done[worker.args.agent] = False
+                        review_ready_announced = False
 
             if worker.active_proc is not None:
+                drain_worker_output(worker)
                 exit_code = worker.active_proc.poll()
                 if exit_code is not None:
-                    run_out = collect_completed_output(worker.active_proc)
+                    run_out = collected_worker_output(worker)
                     worker.active_proc = None
                     worker.active_started_ms = 0
+                    reset_worker_output_capture(worker)
                     publish_worker_result(
                         worker=worker,
                         lead=lead,
@@ -554,6 +740,7 @@ def main() -> int:
             current = now_ms()
             if (
                 not worker.stopped
+                and worker.active_proc is None
                 and current - worker.last_activity >= worker.args.idle_ms
                 and current - worker.last_idle_sent >= worker.args.idle_ms
             ):
@@ -587,6 +774,42 @@ def main() -> int:
                     ],
                 )
                 worker.last_idle_sent = current
+
+        lead_mention_token = team_fs.mailbox_signal_token(paths, lead)
+        if lead_mention_token != lead_last_mention_token:
+            lead_rows = load_unread_messages_no_mark(paths, lead, limit=500)
+            for row in lead_rows:
+                idx = row.get("index")
+                if not isinstance(idx, int) or idx < 0:
+                    continue
+                if idx in lead_seen_indexes:
+                    continue
+                lead_seen_indexes.add(idx)
+                sender = str(row.get("from", "")).strip()
+                if sender not in worker_done:
+                    continue
+                if worker_message_reports_done(row):
+                    worker_done[sender] = True
+                    review_ready_announced = False
+                    continue
+                if agent_loop.is_actionable_work_message(row):
+                    worker_done[sender] = False
+                    review_ready_announced = False
+            trim_seen_indexes(lead_seen_indexes)
+            lead_last_mention_token = lead_mention_token
+
+        if not review_ready_announced and all_workers_review_ready(workers, worker_done):
+            notify_review_ready(
+                fs_path=fs_path,
+                bus_path=bus_path,
+                db_path=db_path,
+                repo=args.repo,
+                session=args.session,
+                room=args.room,
+                lead=lead,
+                worker_done=worker_done,
+            )
+            review_ready_announced = True
 
         current_loop_ms = now_ms()
         if current_loop_ms - last_heartbeat >= max(500, args.poll_ms):

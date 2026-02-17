@@ -725,8 +725,11 @@ def main() -> int:
 
     last_activity = int(time.time() * 1000)
     last_idle_sent = 0
-    last_mention_token = team_fs.mailbox_signal_token(paths, args.agent)
-    force_mailbox_check = True
+    # Mention-driven mailbox read:
+    # - do not scan continuously
+    # - only read when mention token changes
+    last_mention_token = 0
+    force_mailbox_check = False
 
     while not STOP:
         mention_token = team_fs.mailbox_signal_token(paths, args.agent)
