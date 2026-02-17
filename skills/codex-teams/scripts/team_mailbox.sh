@@ -120,36 +120,43 @@ case "$cmd" in
   members)
     if [[ "$MODE" == "fs" ]]; then
       require_fs
-      raw="$(python3 "$FS" team-get --repo "$REPO" --session "$SESSION" --json)"
+      json_out="false"
       if [[ "${1:-}" == "--json" ]]; then
-        python3 - <<PY
-import json
-cfg = json.loads('''$raw''')
-out=[]
-for m in cfg.get("members", []):
-    if isinstance(m, dict):
-        out.append({
-            "agent": m.get("name", ""),
-            "agent_id": m.get("agentId", ""),
-            "role": m.get("agentType", "member"),
-            "mode": m.get("mode", "auto"),
-            "backend": m.get("backendType", ""),
-            "color": m.get("color", ""),
-        })
-print(json.dumps(out, ensure_ascii=False))
-PY
-      else
-        python3 - <<PY
-import json
-cfg = json.loads('''$raw''')
-name = cfg.get("name", "")
-members = [m for m in cfg.get("members", []) if isinstance(m, dict)]
-print(f"team={name}")
-print(f"members={len(members)}")
-for m in members:
-    print(f"agent={m.get('name','')} role={m.get('agentType','member')} mode={m.get('mode','auto')} backend={m.get('backendType','')}")
-PY
+        json_out="true"
       fi
+      cfg_json="$(python3 "$FS" team-get --repo "$REPO" --session "$SESSION" --json)"
+      TEAM_CFG_JSON="$cfg_json" python3 - "$json_out" <<'PY'
+import json
+import os
+import sys
+
+emit_json = sys.argv[1] == "true"
+cfg = json.loads(os.environ.get("TEAM_CFG_JSON", "{}"))
+
+members = [m for m in cfg.get("members", []) if isinstance(m, dict)]
+if emit_json:
+    out = []
+    for m in members:
+        out.append(
+            {
+                "agent": m.get("name", ""),
+                "agent_id": m.get("agentId", ""),
+                "role": m.get("agentType", "member"),
+                "mode": m.get("mode", "auto"),
+                "backend": m.get("backendType", ""),
+                "color": m.get("color", ""),
+            }
+        )
+    print(json.dumps(out, ensure_ascii=False))
+else:
+    print(f"team={cfg.get('name', '')}")
+    print(f"members={len(members)}")
+    for m in members:
+        print(
+            f"agent={m.get('name','')} role={m.get('agentType','member')} "
+            f"mode={m.get('mode','auto')} backend={m.get('backendType','')}"
+        )
+PY
     else
       require_db
       args=(--db "$DB" members --room "$ROOM")

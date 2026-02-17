@@ -9,7 +9,7 @@ SESSION="codex-fleet"
 WINDOW="swarm"
 ROOM="main"
 PREFIX="worker"
-COUNT="4"
+COUNT="3"
 LEAD_NAME="lead"
 AGENTS_CSV=""
 LINES="20"
@@ -29,7 +29,7 @@ Options:
   --window NAME     tmux window name to watch (default: swarm)
   --room NAME       bus room (default: main)
   --prefix NAME     worker pane prefix (default: worker)
-  --count N         worker count ceiling (default: 4)
+  --count N         worker count ceiling (default: 3)
   --lead-name NAME  leader pane title/name (default: lead)
   --agents-csv CSV  explicit agent names to monitor (e.g. worker-1,utility-1)
   --lines N         pane lines sampled for hash (default: 20)

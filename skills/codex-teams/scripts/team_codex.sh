@@ -2666,11 +2666,17 @@ bus_control_respond() {
   local approve_flag="$3"
   local body="$4"
 
+  local rc=0
   if [[ "$approve_flag" == "true" ]]; then
-    python3 "$BUS" --db "$DB" control-respond --request-id "$request_id" --from "$sender" --approve --body "$body" >/dev/null
+    if ! python3 "$BUS" --db "$DB" control-respond --request-id "$request_id" --from "$sender" --approve --body "$body" >/dev/null 2>&1; then
+      rc=$?
+    fi
   else
-    python3 "$BUS" --db "$DB" control-respond --request-id "$request_id" --from "$sender" --reject --body "$body" >/dev/null
+    if ! python3 "$BUS" --db "$DB" control-respond --request-id "$request_id" --from "$sender" --reject --body "$body" >/dev/null 2>&1; then
+      rc=$?
+    fi
   fi
+  return "$rc"
 }
 
 bus_lookup_request_fields() {
@@ -2864,7 +2870,7 @@ PY
       fi
       local response_body="$body"
       if [[ -f "$DB" ]]; then
-        bus_control_respond "$MESSAGE_REQUEST_ID" "$MESSAGE_SENDER" "$MESSAGE_APPROVE" "$response_body"
+        bus_control_respond "$MESSAGE_REQUEST_ID" "$MESSAGE_SENDER" "$MESSAGE_APPROVE" "$response_body" || true
       fi
 
       local req_info req_type req_sender req_target

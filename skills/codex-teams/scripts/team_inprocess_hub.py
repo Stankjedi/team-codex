@@ -39,6 +39,8 @@ class WorkerState:
     pending_targets: dict[str, set[str]] = field(default_factory=dict)
     last_activity: int = 0
     last_idle_sent: int = 0
+    last_mention_token: int = 0
+    force_mailbox_check: bool = True
     stopped: bool = False
 
 
@@ -122,53 +124,24 @@ def bus_cmd(bus_path: Path, db_path: Path, args: list[str]) -> None:
     subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def load_unread_messages(fs_path: Path, worker: WorkerState) -> list[dict]:
-    rc, stdout = fs_cmd(
-        fs_path,
-        [
-            "mailbox-read",
-            "--repo",
-            worker.args.repo,
-            "--session",
-            worker.args.session,
-            "--agent",
-            worker.args.agent,
-            "--unread",
-            "--json",
-            "--limit",
-            "200",
-        ],
-    )
-    if rc != 0 or not stdout.strip():
-        return []
+def load_unread_messages(paths: team_fs.FsPaths, worker: WorkerState, *, limit: int) -> list[dict]:
     try:
-        decoded = json.loads(stdout)
-    except json.JSONDecodeError:
+        values = team_fs.mailbox_read_indexed(
+            paths,
+            worker.args.agent,
+            unread=True,
+            limit=limit,
+            mark_read_selected=True,
+        )
+    except Exception:
         return []
-    if not isinstance(decoded, list):
-        return []
+
     rows: list[dict] = []
-    for row in decoded:
-        if isinstance(row, dict):
-            rows.append(row)
+    for idx, row in values:
+        if not isinstance(row, dict):
+            continue
+        rows.append({"index": idx, **row})
     return rows
-
-
-def mark_read_indexes(fs_path: Path, worker: WorkerState, indexes: list[int]) -> None:
-    if not indexes:
-        return
-    cmd = [
-        "mailbox-mark-read",
-        "--repo",
-        worker.args.repo,
-        "--session",
-        worker.args.session,
-        "--agent",
-        worker.args.agent,
-    ]
-    for idx in indexes:
-        cmd.extend(["--index", str(idx)])
-    fs_cmd(fs_path, cmd)
 
 
 def worker_online(bus_path: Path, db_path: Path, fs_path: Path, worker: WorkerState) -> None:
@@ -360,6 +333,7 @@ def main() -> int:
                 cwd=cwd,
                 prompt_prefix=f"{prompt_base}\n**Your Identity:**\n- Name: {name}\n",
                 last_activity=now_ms(),
+                last_mention_token=team_fs.mailbox_signal_token(paths, name),
             )
         )
 
@@ -398,16 +372,17 @@ def main() -> int:
             if STOP or worker.stopped:
                 continue
 
-            unread = load_unread_messages(fs_path, worker)
+            mention_token = team_fs.mailbox_signal_token(paths, worker.args.agent)
+            should_check_mailbox = worker.force_mailbox_check or mention_token != worker.last_mention_token
+            unread: list[dict] = []
+            if should_check_mailbox:
+                unread = load_unread_messages(paths, worker, limit=200)
+                worker.force_mailbox_check = False
+                worker.last_mention_token = mention_token
             if unread:
-                indexes: list[int] = []
                 messages: list[dict] = []
                 for item in unread:
-                    idx = item.get("index")
-                    if isinstance(idx, int) and idx >= 0:
-                        indexes.append(idx)
                     messages.append(item)
-                mark_read_indexes(fs_path, worker, indexes)
 
                 should_shutdown, work_messages = agent_loop.handle_control_messages(
                     args=worker.args,

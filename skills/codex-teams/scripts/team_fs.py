@@ -79,6 +79,7 @@ class FsPaths:
     config: Path
     team_legacy: Path
     inboxes: Path
+    signals: Path
     tasks: Path
     state: Path
     runtime: Path
@@ -139,6 +140,7 @@ def resolve_paths(repo: str, session: str) -> FsPaths:
         config=root / "config.json",
         team_legacy=root / "team.json",
         inboxes=root / "inboxes",
+        signals=root / "signals",
         tasks=root / "tasks",
         state=root / "state.json",
         runtime=root / "runtime.json",
@@ -149,6 +151,7 @@ def resolve_paths(repo: str, session: str) -> FsPaths:
 def ensure_dirs(p: FsPaths) -> None:
     p.root.mkdir(parents=True, exist_ok=True)
     p.inboxes.mkdir(parents=True, exist_ok=True)
+    p.signals.mkdir(parents=True, exist_ok=True)
     p.tasks.mkdir(parents=True, exist_ok=True)
 
 
@@ -239,6 +242,30 @@ def ensure_inbox(p: FsPaths, agent: str) -> None:
         write_json(ip, {"agent": agent, "messages": []})
 
 
+def mailbox_signal_path(p: FsPaths, agent: str) -> Path:
+    return p.signals / f"{agent}.mention"
+
+
+def touch_mailbox_signal(p: FsPaths, agent: str) -> None:
+    sp = mailbox_signal_path(p, agent)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if sp.exists():
+            os.utime(sp, None)
+        else:
+            sp.touch()
+    except OSError:
+        return
+
+
+def mailbox_signal_token(p: FsPaths, agent: str) -> int:
+    sp = mailbox_signal_path(p, agent)
+    try:
+        return int(sp.stat().st_mtime_ns)
+    except OSError:
+        return 0
+
+
 def clear_runtime_artifacts(p: FsPaths) -> None:
     if p.inboxes.exists():
         for child in p.inboxes.iterdir():
@@ -253,6 +280,14 @@ def clear_runtime_artifacts(p: FsPaths) -> None:
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
             else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+
+    if p.signals.exists():
+        for child in p.signals.iterdir():
+            if child.is_file():
                 try:
                     child.unlink()
                 except OSError:
@@ -298,7 +333,9 @@ def write_mailbox(p: FsPaths, agent: str, message: dict[str, Any]) -> int:
         msg.setdefault("timestamp", utc_now_iso_ms())
         msg.setdefault("read", False)
         msgs.append(msg)
-        return len(msgs) - 1
+        idx = len(msgs) - 1
+    touch_mailbox_signal(p, agent)
+    return idx
 
 
 def unread_indexed(p: FsPaths, agent: str) -> list[tuple[int, dict[str, Any]]]:
@@ -326,6 +363,49 @@ def mark_read(p: FsPaths, agent: str, indexes: Iterable[int], mark_all: bool) ->
                     msg["read"] = True
                     changed += 1
     return changed
+
+
+def mailbox_read_indexed(
+    p: FsPaths,
+    agent: str,
+    *,
+    unread: bool,
+    limit: int,
+    mark_read_selected: bool,
+) -> list[tuple[int, dict[str, Any]]]:
+    ensure_inbox(p, agent)
+    if not mark_read_selected:
+        values = unread_indexed(p, agent) if unread else list(enumerate(read_mailbox(p, agent)))
+        if limit > 0:
+            values = values[-limit:]
+        return values
+
+    ip = inbox_path(p, agent)
+    with locked_json(ip, {"agent": agent, "messages": []}) as box:
+        msgs = box.setdefault("messages", [])
+        if not isinstance(msgs, list):
+            msgs = []
+            box["messages"] = msgs
+
+        values: list[tuple[int, dict[str, Any]]] = []
+        for idx, msg in enumerate(msgs):
+            if not isinstance(msg, dict):
+                continue
+            if unread and bool(msg.get("read", False)):
+                continue
+            values.append((idx, deep_copy(msg)))
+        if limit > 0:
+            values = values[-limit:]
+
+        selected_indexes = {idx for idx, _ in values}
+        if selected_indexes:
+            for idx, msg in enumerate(msgs):
+                if idx not in selected_indexes or not isinstance(msg, dict):
+                    continue
+                if not bool(msg.get("read", False)):
+                    msg["read"] = True
+
+        return values
 
 
 def read_state(p: FsPaths) -> dict[str, Any]:
@@ -468,20 +548,43 @@ def resolve_control_response(
         if not req_type_override:
             raise SystemExit(f"request not found: {request_id}")
         req_type = normalize_control_type(req_type_override)
-        req = {
+        status = "approved" if approve else "rejected"
+        response_body = body or status
+        recipient = recipient_override.strip() or lead_name(cfg)
+        # Compatibility fallback for legacy responders:
+        # emit response delivery, but never persist a synthetic control request.
+        deliver_message(
+            p,
+            cfg,
+            msg_type=f"{req_type}_response",
+            sender=responder,
+            recipient=recipient,
+            content=response_body,
+            summary="",
+            request_id=request_id,
+            approve=approve,
+            meta={
+                "request_id": request_id,
+                "req_type": req_type,
+                "approve": approve,
+                "state": status,
+                "synthetic": True,
+            },
+        )
+        return {
             "request_id": request_id,
             "req_type": req_type,
-            "sender": recipient_override or lead_name(cfg),
+            "sender": recipient,
             "recipient": responder,
             "body": "",
             "summary": "",
-            "status": "pending",
-            "created_ts": utc_now_iso_ms(),
+            "status": status,
+            "created_ts": "",
             "updated_ts": utc_now_iso_ms(),
-            "response_body": "",
-            "responder": "",
+            "response_body": response_body,
+            "responder": responder,
+            "synthetic": True,
         }
-        reqs[request_id] = req
 
     if str(req.get("status", "")) != "pending":
         raise SystemExit(f"request already resolved: {request_id} status={req.get('status', '')}")
@@ -972,6 +1075,7 @@ def cmd_control_respond(args: argparse.Namespace) -> int:
     print(f"req_type={req.get('req_type', '')}")
     print(f"sender={req.get('sender', '')}")
     print(f"recipient={req.get('recipient', '')}")
+    print(f"synthetic={str(bool(req.get('synthetic', False))).lower()}")
     return 0
 
 
@@ -1044,9 +1148,13 @@ def cmd_mailbox_write(args: argparse.Namespace) -> int:
 
 def cmd_mailbox_read(args: argparse.Namespace) -> int:
     p = resolve_paths(args.repo, args.session)
-    values = unread_indexed(p, args.agent) if args.unread else list(enumerate(read_mailbox(p, args.agent)))
-    if args.limit > 0:
-        values = values[-args.limit :]
+    values = mailbox_read_indexed(
+        p,
+        args.agent,
+        unread=bool(args.unread),
+        limit=int(args.limit),
+        mark_read_selected=bool(args.mark_read),
+    )
     if args.json:
         print(json.dumps([{"index": idx, **msg} for idx, msg in values], ensure_ascii=False))
     else:
@@ -1156,24 +1264,49 @@ def cmd_inbox_poll(args: argparse.Namespace) -> int:
     if not isinstance(perm_queue, list):
         perm_queue = []
         perm_state["queue"] = perm_queue
+    existing_queue_keys: set[tuple[str, int]] = set()
+    for item in queue:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("mailbox_index")
+        if isinstance(idx, int) and idx >= 0:
+            existing_queue_keys.add((str(item.get("agent", "")), idx))
+    existing_perm_keys: set[str] = set()
+    for item in perm_queue:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("request_id", "")).strip()
+        if rid:
+            existing_perm_keys.add(f"request:{rid}")
+            continue
+        idx = item.get("mailbox_index")
+        if isinstance(idx, int) and idx >= 0:
+            existing_perm_keys.add(f"mailbox:{idx}")
     payload: list[dict[str, Any]] = []
     for idx, msg in indexed:
         item = {"mailbox_index": idx, "agent": args.agent, "message": msg}
-        queue.append(item)
+        queue_key = (str(args.agent), idx)
+        if queue_key not in existing_queue_keys:
+            queue.append(item)
+            existing_queue_keys.add(queue_key)
         payload.append(item)
         if str(msg.get("type", "")) == "permission_request":
-            perm_queue.append(
-                {
-                    "mailbox_index": idx,
-                    "request_id": msg.get("request_id", ""),
-                    "from": msg.get("from", ""),
-                    "summary": msg.get("summary", ""),
-                    "text": msg.get("text", ""),
-                    "timestamp": msg.get("timestamp", ""),
-                    "color": msg.get("color", "blue"),
-                    "recipient": msg.get("recipient", ""),
-                }
-            )
+            request_id = str(msg.get("request_id", "")).strip()
+            perm_key = f"request:{request_id}" if request_id else f"mailbox:{idx}"
+            if perm_key not in existing_perm_keys:
+                perm_queue.append(
+                    {
+                        "mailbox_index": idx,
+                        "request_id": request_id,
+                        "from": msg.get("from", ""),
+                        "summary": msg.get("summary", ""),
+                        "text": msg.get("text", ""),
+                        "timestamp": msg.get("timestamp", ""),
+                        "color": msg.get("color", "blue"),
+                        "recipient": msg.get("recipient", ""),
+                    }
+                )
+                existing_perm_keys.add(perm_key)
     if args.mark_read and indexed:
         mark_read(p, args.agent, indexes=[idx for idx, _ in indexed], mark_all=False)
     write_state(p, state)
@@ -1428,6 +1561,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unread", action="store_true")
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--mark-read", action="store_true")
     p.set_defaults(func=cmd_mailbox_read)
 
     p = sub.add_parser("mailbox-mark-read")

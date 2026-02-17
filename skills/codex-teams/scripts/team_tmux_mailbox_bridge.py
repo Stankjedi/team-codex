@@ -17,7 +17,12 @@ from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-FS_PATH = SCRIPT_DIR / "team_fs.py"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import team_fs  # noqa: E402
+
+
 NON_ACTIONABLE_PROMPT_TYPES = {
     "status",
     "idle_notification",
@@ -34,10 +39,6 @@ NON_ACTIONABLE_PROMPT_TYPES = {
 def run_cmd(cmd: list[str]) -> tuple[int, str]:
     proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return proc.returncode, proc.stdout or ""
-
-
-def fs_cmd(args: list[str]) -> tuple[int, str]:
-    return run_cmd([sys.executable, str(FS_PATH), *args])
 
 
 def has_tmux_session(session: str) -> bool:
@@ -73,52 +74,30 @@ def iter_running_tmux_agents(runtime: dict) -> list[tuple[str, str]]:
     return rows
 
 
-def read_unread(repo: str, session: str, agent: str, limit: int) -> list[dict]:
-    rc, out = fs_cmd(
-        [
-            "mailbox-read",
-            "--repo",
-            repo,
-            "--session",
-            session,
-            "--agent",
-            agent,
-            "--unread",
-            "--json",
-            "--limit",
-            str(limit),
-        ]
-    )
-    if rc != 0 or not out.strip():
-        return []
+def read_unread(paths: team_fs.FsPaths, agent: str, limit: int) -> list[dict]:
     try:
-        decoded = json.loads(out)
-    except json.JSONDecodeError:
+        values = team_fs.mailbox_read_indexed(
+            paths,
+            agent,
+            unread=True,
+            limit=limit,
+            mark_read_selected=False,
+        )
+    except Exception:
         return []
-    if not isinstance(decoded, list):
-        return []
+
     rows: list[dict] = []
-    for item in decoded:
-        if isinstance(item, dict):
-            rows.append(item)
+    for idx, item in values:
+        if not isinstance(item, dict):
+            continue
+        rows.append({"index": idx, **item})
     return rows
 
 
-def mark_read(repo: str, session: str, agent: str, indexes: list[int]) -> None:
+def mark_read(paths: team_fs.FsPaths, agent: str, indexes: list[int]) -> int:
     if not indexes:
-        return
-    cmd = [
-        "mailbox-mark-read",
-        "--repo",
-        repo,
-        "--session",
-        session,
-        "--agent",
-        agent,
-    ]
-    for idx in indexes:
-        cmd.extend(["--index", str(idx)])
-    fs_cmd(cmd)
+        return 0
+    return team_fs.mark_read(paths, agent, indexes=indexes, mark_all=False)
 
 
 def trim_text(raw: str, limit: int = 1000) -> str:
@@ -241,8 +220,7 @@ def kill_worker_tmux_target(*, tmux_session: str, pane_id: str, window_name: str
 
 def auto_shutdown_done_worker(
     *,
-    repo: str,
-    session: str,
+    paths: team_fs.FsPaths,
     tmux_session: str,
     runtime: dict,
     worker: str,
@@ -262,21 +240,9 @@ def auto_shutdown_done_worker(
     if not kill_worker_tmux_target(tmux_session=tmux_session, pane_id=pane_id, window_name=window_name):
         return False
 
-    fs_cmd(
-        [
-            "runtime-mark",
-            "--repo",
-            repo,
-            "--session",
-            session,
-            "--agent",
-            worker,
-            "--status",
-            "terminated",
-        ]
-    )
     rec["status"] = "terminated"
     rec["updatedAt"] = int(time.time() * 1000)
+    team_fs.write_runtime(paths, runtime)
     return True
 
 
@@ -294,7 +260,9 @@ def main() -> int:
 
     tmux_session = args.tmux_session.strip() or args.session
     auto_kill_done_workers = parse_bool(args.auto_kill_done_workers)
-    runtime_path = Path(args.repo).resolve() / ".codex-teams" / args.session / "runtime.json"
+    paths = team_fs.resolve_paths(args.repo, args.session)
+    runtime_path = paths.runtime
+    mention_tokens: dict[str, int] = {}
 
     if args.poll_ms < 100:
         args.poll_ms = 100
@@ -303,15 +271,29 @@ def main() -> int:
 
     while has_tmux_session(tmux_session):
         runtime = load_runtime(runtime_path)
-        for agent, pane_id in iter_running_tmux_agents(runtime):
-            rows = read_unread(args.repo, args.session, agent, args.limit)
+        running_agents = iter_running_tmux_agents(runtime)
+        active_names = {agent for agent, _ in running_agents}
+        for name in list(mention_tokens.keys()):
+            if name not in active_names:
+                mention_tokens.pop(name, None)
+
+        for agent, pane_id in running_agents:
+            token = team_fs.mailbox_signal_token(paths, agent)
+            prev_token = mention_tokens.get(agent)
+            if prev_token is not None and token == prev_token:
+                continue
+
+            rows = read_unread(paths, agent, args.limit)
             if not rows:
+                mention_tokens[agent] = token
                 continue
 
             marked_indexes: list[int] = []
+            needs_retry = False
             for row in rows:
                 idx = row.get("index")
                 if not isinstance(idx, int):
+                    needs_retry = True
                     continue
                 done_worker = ""
                 if auto_kill_done_workers:
@@ -330,17 +312,25 @@ def main() -> int:
                     )
                     if inject_prompt(pane_id, prompt):
                         marked_indexes.append(idx)
+                    else:
+                        needs_retry = True
                 else:
                     marked_indexes.append(idx)
                 if done_worker:
                     auto_shutdown_done_worker(
-                        repo=args.repo,
-                        session=args.session,
+                        paths=paths,
                         tmux_session=tmux_session,
                         runtime=runtime,
                         worker=done_worker,
                     )
-            mark_read(args.repo, args.session, agent, marked_indexes)
+            marked_count = mark_read(paths, agent, marked_indexes)
+            if marked_count < len(marked_indexes):
+                needs_retry = True
+
+            if needs_retry:
+                mention_tokens.pop(agent, None)
+            else:
+                mention_tokens[agent] = token
 
         time.sleep(max(0.1, args.poll_ms / 1000.0))
 

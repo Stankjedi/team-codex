@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -104,6 +105,88 @@ def parse_meta(raw_meta: object) -> dict:
             return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
+
+
+def member_name_set(cfg: dict) -> set[str]:
+    names: set[str] = set()
+    for rec in team_fs.members(cfg):
+        name = str(rec.get("name", "")).strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def resolve_member_names(args: argparse.Namespace, cfg: dict) -> set[str]:
+    names = member_name_set(cfg)
+    try:
+        latest_paths = team_fs.resolve_paths(args.repo, args.session)
+        latest_cfg = team_fs.read_config(latest_paths)
+        names.update(member_name_set(latest_cfg))
+    except Exception:
+        pass
+    if args.agent:
+        names.add(str(args.agent))
+    return names
+
+
+def load_control_request(repo: str, session: str, request_id: str, db_path: Path) -> dict:
+    rid = str(request_id or "").strip()
+    if not rid:
+        return {}
+
+    # Primary source: filesystem control store.
+    try:
+        paths = team_fs.resolve_paths(repo, session)
+        req = team_fs.get_control_request(paths, rid)
+        if isinstance(req, dict):
+            return req
+    except Exception:
+        pass
+
+    # Fallback source: SQLite control_requests table.
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT request_id, req_type, sender, recipient, status
+                FROM control_requests
+                WHERE request_id=?
+                """,
+                (rid,),
+            ).fetchone()
+    except sqlite3.Error:
+        return {}
+
+    if row is None:
+        return {}
+    return {
+        "request_id": str(row["request_id"]),
+        "req_type": str(row["req_type"]),
+        "sender": str(row["sender"]),
+        "recipient": str(row["recipient"]),
+        "status": str(row["status"]),
+    }
+
+
+def load_unread_messages(paths: team_fs.FsPaths, agent: str, *, limit: int) -> list[dict]:
+    try:
+        values = team_fs.mailbox_read_indexed(
+            paths,
+            agent,
+            unread=True,
+            limit=limit,
+            mark_read_selected=True,
+        )
+    except Exception:
+        return []
+
+    rows: list[dict] = []
+    for idx, msg in values:
+        if not isinstance(msg, dict):
+            continue
+        rows.append({"index": idx, **msg})
+    return rows
 
 
 def is_actionable_work_message(message: dict) -> bool:
@@ -278,6 +361,7 @@ def handle_control_messages(
     should_shutdown = False
     work_messages: list[dict] = []
     lead = resolve_lead(cfg)
+    known_members = resolve_member_names(args, cfg)
 
     for msg in messages:
         mtype = str(msg.get("type", ""))
@@ -348,8 +432,44 @@ def handle_control_messages(
 
         if mtype == "mode_set_request":
             requested_mode = str(meta.get("mode", "")).strip() or text.strip()
-            approved = requested_mode in PERMISSION_MODES
-            response_text = "mode updated"
+            requester = sender.strip()
+            response_text = ""
+            approved = False
+
+            control_req = load_control_request(args.repo, args.session, request_id, db_path) if request_id else {}
+            has_control_req = bool(control_req)
+
+            if requester not in known_members:
+                response_text = f"unauthorized mode_set_request sender={requester or '<unknown>'}"
+            elif not requested_mode:
+                response_text = "missing mode in mode_set_request"
+            elif requested_mode not in PERMISSION_MODES:
+                response_text = f"unsupported mode={requested_mode}"
+            elif has_control_req:
+                req_type = str(control_req.get("req_type", "")).strip()
+                req_status = str(control_req.get("status", "")).strip()
+                req_sender = str(control_req.get("sender", "")).strip()
+                req_recipient = str(control_req.get("recipient", "")).strip()
+                if req_type != "mode_set":
+                    response_text = f"request type mismatch: expected mode_set got={req_type or 'unknown'}"
+                elif req_status != "pending":
+                    response_text = f"request already resolved: status={req_status or 'unknown'}"
+                elif req_sender and requester and req_sender != requester:
+                    response_text = f"request sender mismatch: expected={req_sender} got={requester}"
+                elif req_recipient and req_recipient != args.agent:
+                    response_text = f"request recipient mismatch: expected={req_recipient} got={args.agent}"
+                else:
+                    approved = True
+                    response_text = "mode updated"
+            else:
+                # Compatibility path: allow direct mode_set request from known teammates
+                # even when no control request record exists.
+                approved = True
+                if request_id:
+                    response_text = f"mode updated (compatibility: request_id_not_found={request_id})"
+                else:
+                    response_text = "mode updated (compatibility: no request_id)"
+
             if approved:
                 args.permission_mode = requested_mode
                 rc, _ = fs_cmd(
@@ -369,10 +489,8 @@ def handle_control_messages(
                 if rc != 0:
                     approved = False
                     response_text = f"failed to set mode={requested_mode}"
-            else:
-                response_text = f"unsupported mode={requested_mode}"
 
-            if request_id:
+            if request_id and has_control_req:
                 bus_cmd(
                     bus_path,
                     db_path,
@@ -607,55 +725,24 @@ def main() -> int:
 
     last_activity = int(time.time() * 1000)
     last_idle_sent = 0
+    last_mention_token = team_fs.mailbox_signal_token(paths, args.agent)
+    force_mailbox_check = True
 
     while not STOP:
-        rc, stdout = fs_cmd(
-            fs_path,
-            [
-                "mailbox-read",
-                "--repo",
-                args.repo,
-                "--session",
-                args.session,
-                "--agent",
-                args.agent,
-                "--unread",
-                "--json",
-                "--limit",
-                "200",
-            ],
-        )
+        mention_token = team_fs.mailbox_signal_token(paths, args.agent)
+        should_check_mailbox = force_mailbox_check or mention_token != last_mention_token
         unread: list[dict] = []
-        if rc == 0 and stdout.strip():
-            try:
-                unread = json.loads(stdout)
-            except json.JSONDecodeError:
-                unread = []
+        if should_check_mailbox:
+            unread = load_unread_messages(paths, args.agent, limit=200)
+            force_mailbox_check = False
+            last_mention_token = mention_token
 
         if unread:
-            indexes: list[int] = []
             messages: list[dict] = []
             for item in unread:
                 if not isinstance(item, dict):
                     continue
-                idx = int(item.get("index", -1))
-                if idx >= 0:
-                    indexes.append(idx)
                 messages.append(item)
-
-            if indexes:
-                cmd = [
-                    "mailbox-mark-read",
-                    "--repo",
-                    args.repo,
-                    "--session",
-                    args.session,
-                    "--agent",
-                    args.agent,
-                ]
-                for idx in indexes:
-                    cmd.extend(["--index", str(idx)])
-                fs_cmd(fs_path, cmd)
 
             should_shutdown, work_messages = handle_control_messages(
                 args=args,
