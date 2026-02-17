@@ -41,6 +41,8 @@ class WorkerState:
     last_idle_sent: int = 0
     last_mention_token: int = 0
     force_mailbox_check: bool = True
+    active_proc: subprocess.Popen[str] | None = None
+    active_started_ms: int = 0
     stopped: bool = False
 
 
@@ -67,19 +69,18 @@ def role_from_agent_name(name: str, lead_name: str = "lead") -> str:
     return "worker"
 
 
-def run_cmd(cmd: list[str], *, cwd: str) -> tuple[int, str]:
+def spawn_cmd(cmd: list[str], *, cwd: str) -> tuple[subprocess.Popen[str] | None, str]:
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            check=False,
         )
     except OSError as exc:
-        return 127, f"failed to execute {' '.join(cmd)}: {exc}"
-    return proc.returncode, proc.stdout or ""
+        return None, f"failed to execute {' '.join(cmd)}: {exc}"
+    return proc, ""
 
 
 def utc_now_iso() -> str:
@@ -221,6 +222,108 @@ def worker_offline(bus_path: Path, db_path: Path, fs_path: Path, worker: WorkerS
             "offline backend=in-process-shared",
         ],
     )
+
+
+def build_worker_cmd(worker: WorkerState, prompt: str) -> list[str]:
+    cmd = agent_loop.codex_exec_base(worker.args.codex_bin, worker.args.permission_mode)
+    if worker.args.model:
+        cmd.extend(["-m", worker.args.model])
+    if worker.args.profile:
+        cmd.extend(["-p", worker.args.profile])
+    cmd.extend(["-C", worker.cwd, prompt])
+    return cmd
+
+
+def publish_worker_result(
+    *,
+    worker: WorkerState,
+    lead: str,
+    fs_path: Path,
+    bus_path: Path,
+    db_path: Path,
+    exit_code: int,
+    run_out: str,
+) -> None:
+    summary = agent_loop.summarize_output(run_out, limit=220) or "empty output"
+    kind = "status" if exit_code == 0 else "blocker"
+    body = (
+        f"processed prompt exit={exit_code} summary={summary}"
+        if exit_code == 0
+        else f"codex exec failed exit={exit_code} summary={summary}"
+    )
+    if worker.args.agent != lead:
+        bus_cmd(
+            bus_path,
+            db_path,
+            [
+                "send",
+                "--room",
+                worker.args.room,
+                "--from",
+                worker.args.agent,
+                "--to",
+                lead,
+                "--kind",
+                kind,
+                "--body",
+                body,
+            ],
+        )
+        agent_loop.dispatch_message(
+            fs_path=fs_path,
+            args=worker.args,
+            msg_type="message",
+            sender=worker.args.agent,
+            recipient=lead,
+            content=body,
+            summary="work-update" if exit_code == 0 else "work-blocker",
+        )
+
+    agent_loop.emit_collaboration_updates(
+        fs_path=fs_path,
+        bus_path=bus_path,
+        db_path=db_path,
+        args=worker.args,
+        lead=lead,
+        sender=worker.args.agent,
+        targets=worker.pending_targets,
+        result_body=body,
+        exit_code=exit_code,
+    )
+    worker.pending_targets = {}
+    worker.last_activity = now_ms()
+
+
+def collect_completed_output(proc: subprocess.Popen[str]) -> str:
+    out = ""
+    try:
+        if proc.stdout is not None:
+            out = proc.stdout.read()
+    except Exception:
+        out = ""
+    return out or ""
+
+
+def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None:
+    proc = worker.active_proc
+    if proc is None:
+        return
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        deadline = time.time() + timeout_sec
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    collect_completed_output(proc)
+    worker.active_proc = None
+    worker.active_started_ms = 0
 
 
 def main() -> int:
@@ -393,6 +496,7 @@ def main() -> int:
                     cfg=cfg,
                 )
                 if should_shutdown:
+                    terminate_worker_proc(worker)
                     worker.stopped = True
                     worker_offline(bus_path, db_path, fs_path, worker)
                     continue
@@ -410,67 +514,42 @@ def main() -> int:
                 if work_messages:
                     worker.last_activity = now_ms()
 
-            if worker.pending_texts:
+            if worker.pending_texts and worker.active_proc is None:
                 prompt = "\n".join(worker.pending_texts)
                 worker.pending_texts = []
                 prompt = f"{worker.prompt_prefix}\n\n{prompt}"
-
-                cmd = agent_loop.codex_exec_base(worker.args.codex_bin, worker.args.permission_mode)
-                if worker.args.model:
-                    cmd.extend(["-m", worker.args.model])
-                if worker.args.profile:
-                    cmd.extend(["-p", worker.args.profile])
-                cmd.extend(["-C", worker.cwd, prompt])
-
-                exit_code, run_out = run_cmd(cmd, cwd=worker.cwd)
-                summary = agent_loop.summarize_output(run_out, limit=220) or "empty output"
-                kind = "status" if exit_code == 0 else "blocker"
-                body = (
-                    f"processed prompt exit={exit_code} summary={summary}"
-                    if exit_code == 0
-                    else f"codex exec failed exit={exit_code} summary={summary}"
-                )
-                if worker.args.agent != lead:
-                    bus_cmd(
-                        bus_path,
-                        db_path,
-                        [
-                            "send",
-                            "--room",
-                            worker.args.room,
-                            "--from",
-                            worker.args.agent,
-                            "--to",
-                            lead,
-                            "--kind",
-                            kind,
-                            "--body",
-                            body,
-                        ],
-                    )
-                    agent_loop.dispatch_message(
+                cmd = build_worker_cmd(worker, prompt)
+                proc, err = spawn_cmd(cmd, cwd=worker.cwd)
+                if proc is None:
+                    publish_worker_result(
+                        worker=worker,
+                        lead=lead,
                         fs_path=fs_path,
-                        args=worker.args,
-                        msg_type="message",
-                        sender=worker.args.agent,
-                        recipient=lead,
-                        content=body,
-                        summary="work-update" if exit_code == 0 else "work-blocker",
+                        bus_path=bus_path,
+                        db_path=db_path,
+                        exit_code=127,
+                        run_out=err,
                     )
+                else:
+                    worker.active_proc = proc
+                    worker.active_started_ms = now_ms()
+                    worker.last_activity = worker.active_started_ms
 
-                agent_loop.emit_collaboration_updates(
-                    fs_path=fs_path,
-                    bus_path=bus_path,
-                    db_path=db_path,
-                    args=worker.args,
-                    lead=lead,
-                    sender=worker.args.agent,
-                    targets=worker.pending_targets,
-                    result_body=body,
-                    exit_code=exit_code,
-                )
-                worker.pending_targets = {}
-                worker.last_activity = now_ms()
+            if worker.active_proc is not None:
+                exit_code = worker.active_proc.poll()
+                if exit_code is not None:
+                    run_out = collect_completed_output(worker.active_proc)
+                    worker.active_proc = None
+                    worker.active_started_ms = 0
+                    publish_worker_result(
+                        worker=worker,
+                        lead=lead,
+                        fs_path=fs_path,
+                        bus_path=bus_path,
+                        db_path=db_path,
+                        exit_code=exit_code,
+                        run_out=run_out,
+                    )
 
             current = now_ms()
             if (
@@ -528,6 +607,8 @@ def main() -> int:
 
         time.sleep(max(0.1, args.poll_ms / 1000.0))
 
+    for worker in workers:
+        terminate_worker_proc(worker)
     for worker in workers:
         if not worker.stopped:
             worker_offline(bus_path, db_path, fs_path, worker)
