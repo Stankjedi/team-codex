@@ -6,7 +6,7 @@
 - 리더: 현재 Codex IDE 채팅 세션(외부 리더)
 - 워커: `worker-1`, `worker-2`, `worker-3` (고정 3명)
 - 유일 런타임: `in-process-shared` (리소스 절약형)
-- 독립 실행: `codex-ma` 없이 `codex-teams`만으로 동작
+- 독립 실행: `codex-teams` 단독으로 동작
 
 ## 1. 준비물
 
