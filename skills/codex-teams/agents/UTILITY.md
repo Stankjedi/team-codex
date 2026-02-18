@@ -12,7 +12,7 @@
 - `CODEX_TEAM_GIT_BIN` 또는 `GIT_BIN`이 지정된 경우 해당 git 바이너리 우선 사용
 
 ## 협업 대상
-- `lead`, `worker-*`
+- `lead`, `reviewer-1`, `worker-*`
 
 ## done 기준
 - push/merge 수행 로그와 최종 브랜치 상태가 재현 가능해야 함

@@ -12,7 +12,6 @@ import json
 import os
 import shlex
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -130,12 +129,12 @@ def resolve_member_names(args: argparse.Namespace, cfg: dict) -> set[str]:
     return names
 
 
-def load_control_request(repo: str, session: str, request_id: str, db_path: Path) -> dict:
+def load_control_request(repo: str, session: str, request_id: str, _db_path: Path) -> dict:
     rid = str(request_id or "").strip()
     if not rid:
         return {}
 
-    # Primary source: filesystem control store.
+    # Filesystem control store is the sole authority for runtime control handling.
     try:
         paths = team_fs.resolve_paths(repo, session)
         req = team_fs.get_control_request(paths, rid)
@@ -143,31 +142,7 @@ def load_control_request(repo: str, session: str, request_id: str, db_path: Path
             return req
     except Exception:
         pass
-
-    # Fallback source: SQLite control_requests table.
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                """
-                SELECT request_id, req_type, sender, recipient, status
-                FROM control_requests
-                WHERE request_id=?
-                """,
-                (rid,),
-            ).fetchone()
-    except sqlite3.Error:
-        return {}
-
-    if row is None:
-        return {}
-    return {
-        "request_id": str(row["request_id"]),
-        "req_type": str(row["req_type"]),
-        "sender": str(row["sender"]),
-        "recipient": str(row["recipient"]),
-        "status": str(row["status"]),
-    }
+    return {}
 
 
 def validate_control_request_record(
@@ -204,7 +179,8 @@ def load_unread_messages(paths: team_fs.FsPaths, agent: str, *, limit: int) -> l
             agent,
             unread=True,
             limit=limit,
-            mark_read_selected=True,
+            oldest_first=True,
+            mark_read_selected=False,
         )
     except Exception:
         return []
@@ -215,6 +191,17 @@ def load_unread_messages(paths: team_fs.FsPaths, agent: str, *, limit: int) -> l
             continue
         rows.append({"index": idx, **msg})
     return rows
+
+
+def mark_agent_indexes_read(paths: team_fs.FsPaths, agent: str, indexes: list[int]) -> bool:
+    valid = sorted({idx for idx in indexes if isinstance(idx, int) and idx >= 0})
+    if not valid:
+        return True
+    try:
+        marked = team_fs.mark_read(paths, agent, indexes=valid, mark_all=False)
+    except Exception:
+        return False
+    return marked >= len(valid)
 
 
 def is_actionable_work_message(message: dict) -> bool:
@@ -292,6 +279,36 @@ def merge_collaboration_targets(into: dict[str, set[str]], updates: dict[str, se
             bucket.add(item)
 
 
+def resolve_worker_peers(*, args: argparse.Namespace, sender: str, lead: str) -> set[str]:
+    peers: set[str] = set()
+    try:
+        paths = team_fs.resolve_paths(args.repo, args.session)
+        cfg = team_fs.read_config(paths)
+    except Exception:
+        cfg = {}
+        paths = None
+    for member in team_fs.members(cfg):
+        name = str(member.get("name", "")).strip()
+        if not name or name in {sender, lead}:
+            continue
+        if name.startswith("worker-"):
+            peers.add(name)
+    if paths is not None:
+        try:
+            runtime = team_fs.read_runtime(paths)
+        except Exception:
+            runtime = {}
+        agents = runtime.get("agents", {}) if isinstance(runtime, dict) else {}
+        if isinstance(agents, dict):
+            for name in agents.keys():
+                worker_name = str(name).strip()
+                if not worker_name or worker_name in {sender, lead}:
+                    continue
+                if worker_name.startswith("worker-"):
+                    peers.add(worker_name)
+    return peers
+
+
 def emit_collaboration_updates(
     *,
     fs_path: Path,
@@ -304,14 +321,20 @@ def emit_collaboration_updates(
     result_body: str,
     exit_code: int,
 ) -> None:
-    for recipient in sorted(targets.keys()):
+    merged_targets: dict[str, set[str]] = {name: set(kinds) for name, kinds in targets.items()}
+    if sender.startswith("worker-"):
+        for peer in resolve_worker_peers(args=args, sender=sender, lead=lead):
+            bucket = merged_targets.setdefault(peer, set())
+            bucket.add("team-sync")
+
+    for recipient in sorted(merged_targets.keys()):
         if not recipient or recipient == sender:
             continue
         # Non-lead teammates already report to lead via primary status channel.
         if sender != lead and recipient == lead:
             continue
 
-        source_types = sorted(targets.get(recipient, set()))
+        source_types = sorted(merged_targets.get(recipient, set()))
         source_types_text = ",".join(source_types) if source_types else "message"
 
         if exit_code != 0:
@@ -320,6 +343,9 @@ def emit_collaboration_updates(
         elif "question" in source_types:
             kind = "answer"
             summary = "peer-answer"
+        elif "team-sync" in source_types:
+            kind = "message"
+            summary = "peer-sync"
         else:
             kind = "message"
             summary = "peer-update"
@@ -353,6 +379,7 @@ def emit_collaboration_updates(
             meta={
                 "source": "collab-update",
                 "source_types": source_types,
+                "team_sync": "team-sync" in source_types,
             },
         )
 
@@ -438,6 +465,8 @@ def handle_control_messages(
                     "shutdown_request recipient mismatch: "
                     f"expected={args.agent} got={envelope_recipient or '<missing>'}"
                 )
+            elif not request_id:
+                response_text = "shutdown_request requires request_id"
             elif requester not in known_members:
                 response_text = f"unauthorized shutdown_request sender={requester or '<unknown>'}"
             elif requester != lead:
@@ -455,11 +484,8 @@ def handle_control_messages(
                 else:
                     approved = True
                     response_text = "shutdown approved"
-            elif request_id:
-                response_text = f"request not found: request_id={request_id}"
             else:
-                approved = True
-                response_text = "shutdown approved (compatibility: no request_id)"
+                response_text = f"request not found: request_id={request_id}"
 
             if request_id and has_control_req:
                 bus_cmd(
@@ -485,19 +511,6 @@ def handle_control_messages(
                     body=response_text,
                     recipient=sender or lead,
                     req_type="shutdown",
-                )
-            else:
-                # Compatibility path for direct mailbox shutdown messages without request ids.
-                dispatch_message(
-                    fs_path=fs_path,
-                    args=args,
-                    msg_type="shutdown_response",
-                    sender=args.agent,
-                    recipient=sender or lead,
-                    content=response_text,
-                    summary=summary,
-                    request_id=request_id,
-                    approve=approved,
                 )
             bus_cmd(
                 bus_path,
@@ -551,6 +564,8 @@ def handle_control_messages(
                     "mode_set_request recipient mismatch: "
                     f"expected={args.agent} got={envelope_recipient or '<missing>'}"
                 )
+            elif not request_id:
+                response_text = "mode_set_request requires request_id"
             elif requester not in known_members:
                 response_text = f"unauthorized mode_set_request sender={requester or '<unknown>'}"
             elif requester != lead:
@@ -572,13 +587,8 @@ def handle_control_messages(
                 else:
                     approved = True
                     response_text = "mode updated"
-            elif request_id:
-                response_text = f"request not found: request_id={request_id}"
             else:
-                # Compatibility path: allow direct mode_set request from known teammates
-                # only when no request-id is provided.
-                approved = True
-                response_text = "mode updated (compatibility: no request_id)"
+                response_text = f"request not found: request_id={request_id}"
 
             if approved:
                 args.permission_mode = requested_mode
@@ -624,18 +634,6 @@ def handle_control_messages(
                     body=response_text,
                     recipient=sender or lead,
                     req_type="mode_set",
-                )
-            else:
-                dispatch_message(
-                    fs_path=fs_path,
-                    args=args,
-                    msg_type="mode_set_response",
-                    sender=args.agent,
-                    recipient=sender or lead,
-                    content=response_text,
-                    summary=summary,
-                    request_id=request_id,
-                    approve=approved,
                 )
             bus_cmd(
                 bus_path,
@@ -752,9 +750,9 @@ def main() -> int:
 
     fs_path = SCRIPT_DIR / "team_fs.py"
     bus_path = SCRIPT_DIR / "team_bus.py"
-    db_path = Path(args.repo).resolve() / ".codex-teams" / args.session / "bus.sqlite"
 
     paths = team_fs.resolve_paths(args.repo, args.session)
+    db_path = paths.root / "bus.sqlite"
     cfg = team_fs.read_config(paths)
     lead = resolve_lead(cfg)
     team_context_prompt = build_team_context_prompt(
@@ -809,6 +807,7 @@ def main() -> int:
     )
 
     pending_texts: list[str] = []
+    pending_indexes: list[int] = []
     pending_collaboration_targets: dict[str, set[str]] = {}
     if args.initial_task.strip():
         pending_texts.append(args.initial_task.strip())
@@ -856,8 +855,24 @@ def main() -> int:
                         lead=lead,
                     )
                 cfg = latest_cfg
-            except Exception:
-                pass
+            except Exception as exc:
+                bus_cmd(
+                    bus_path,
+                    db_path,
+                    [
+                        "send",
+                        "--room",
+                        args.room,
+                        "--from",
+                        args.agent,
+                        "--to",
+                        lead,
+                        "--kind",
+                        "status",
+                        "--body",
+                        f"config refresh failed: {summarize_output(str(exc), limit=120)}",
+                    ],
+                )
             unread = load_unread_messages(paths, args.agent, limit=WORKER_MAILBOX_BATCH)
             force_mailbox_check = False
             last_mention_token = mention_token
@@ -879,27 +894,55 @@ def main() -> int:
                 messages=messages,
                 cfg=cfg,
             )
+
+            actionable_indexes: set[int] = set()
+            for msg in work_messages:
+                idx = msg.get("index")
+                if isinstance(idx, int) and idx >= 0:
+                    actionable_indexes.add(idx)
+            immediate_ack_indexes: list[int] = []
+            for row in messages:
+                idx = row.get("index")
+                if not isinstance(idx, int) or idx < 0:
+                    continue
+                if idx not in actionable_indexes:
+                    immediate_ack_indexes.append(idx)
+            if immediate_ack_indexes and not mark_agent_indexes_read(paths, args.agent, immediate_ack_indexes):
+                force_mailbox_check = True
+            immediate_ack_indexes = []
+
             if should_shutdown:
+                if actionable_indexes and not mark_agent_indexes_read(paths, args.agent, sorted(actionable_indexes)):
+                    force_mailbox_check = True
                 break
 
             for msg in work_messages:
+                idx = msg.get("index")
+                msg_index = idx if isinstance(idx, int) and idx >= 0 else -1
                 text = str(msg.get("text", "")).strip()
                 summary = str(msg.get("summary", "")).strip()
                 sender = str(msg.get("from", ""))
                 if text:
                     pending_texts.append(f"from={sender} summary={summary} text={text}".strip())
+                    pending_indexes.append(msg_index)
+                elif msg_index >= 0:
+                    immediate_ack_indexes.append(msg_index)
             merge_collaboration_targets(
                 pending_collaboration_targets,
                 collect_collaboration_targets(work_messages, self_agent=args.agent),
             )
+            if immediate_ack_indexes and not mark_agent_indexes_read(paths, args.agent, immediate_ack_indexes):
+                force_mailbox_check = True
 
             if work_messages:
                 last_activity = int(time.time() * 1000)
 
         if pending_texts:
+            run_indexes = [idx for idx in pending_indexes if isinstance(idx, int) and idx >= 0]
             prompt = "\n".join(pending_texts)
             prompt = f"{team_context_prompt}\n\n{prompt}"
             pending_texts = []
+            pending_indexes = []
 
             cmd = codex_exec_base(args.codex_bin, args.permission_mode)
             if args.model:
@@ -911,11 +954,13 @@ def main() -> int:
             exit_code, run_out = run_cmd(cmd, cwd=args.cwd)
             summary = summarize_output(run_out, limit=220) or "empty output"
             kind = "status" if exit_code == 0 else "blocker"
-            body = (
-                f"processed prompt exit={exit_code} summary={summary}"
-                if exit_code == 0
-                else f"codex exec failed exit={exit_code} summary={summary}"
-            )
+            state = "complete" if exit_code == 0 else "failed"
+            result_label = "worker_result"
+            summary_tag = "worker-run-complete" if exit_code == 0 else "worker-run-failed"
+            if args.role == "reviewer":
+                result_label = "reviewer_result"
+                summary_tag = "reviewer-run-complete" if exit_code == 0 else "reviewer-run-failed"
+            body = f"{result_label} state={state} exit={exit_code} summary={summary}"
 
             if args.agent != lead:
                 bus_cmd(
@@ -942,7 +987,13 @@ def main() -> int:
                     sender=args.agent,
                     recipient=lead,
                     content=body,
-                    summary="work-update" if exit_code == 0 else "work-blocker",
+                    summary=summary_tag,
+                    meta={
+                        "source": "worker-result",
+                        "worker": args.agent,
+                        "state": state,
+                        "exit_code": exit_code,
+                    },
                 )
 
             emit_collaboration_updates(
@@ -957,6 +1008,8 @@ def main() -> int:
                 exit_code=exit_code,
             )
             pending_collaboration_targets = {}
+            if run_indexes and not mark_agent_indexes_read(paths, args.agent, run_indexes):
+                force_mailbox_check = True
             last_activity = int(time.time() * 1000)
 
         now = int(time.time() * 1000)

@@ -15,6 +15,7 @@ import copy
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -59,6 +60,10 @@ MESSAGE_TYPES = {
     "idle_notification",
     "system",
 }
+SYSTEM_ACTORS = {"system", "monitor", "orchestrator"}
+
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_MAILBOX_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
 
 DEFAULT_STATE = {
     "teamContext": None,
@@ -98,6 +103,29 @@ def deep_copy(v: Any) -> Any:
     return copy.deepcopy(v)
 
 
+def normalize_start_index(value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed >= 0 else 0
+
+
+def validate_session_name(session: str) -> str:
+    raw = str(session or "").strip()
+    if not raw:
+        raise SystemExit("session is required")
+    if "/" in raw or "\\" in raw:
+        raise SystemExit(f"invalid session name: {raw!r} (path separators are not allowed)")
+    if raw in {".", ".."} or ".." in raw:
+        raise SystemExit(f"invalid session name: {raw!r}")
+    if not SESSION_NAME_RE.fullmatch(raw):
+        raise SystemExit(
+            "invalid session name: use 1-128 chars of [A-Za-z0-9._-], must start with alnum"
+        )
+    return raw
+
+
 def sanitize_team_name(name: str) -> str:
     out = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in name.strip())
     while "--" in out:
@@ -132,10 +160,16 @@ def parse_json_object(raw: str | None) -> dict[str, Any]:
 
 def resolve_paths(repo: str, session: str) -> FsPaths:
     repo_path = Path(repo).expanduser().resolve()
-    root = repo_path / ".codex-teams" / session
+    safe_session = validate_session_name(session)
+    base_root = (repo_path / ".codex-teams").resolve()
+    root = (base_root / safe_session).resolve()
+    try:
+        root.relative_to(base_root)
+    except ValueError as exc:
+        raise SystemExit(f"invalid session path outside team root: {safe_session!r}") from exc
     return FsPaths(
         repo=repo_path,
-        session=session,
+        session=safe_session,
         root=root,
         config=root / "config.json",
         team_legacy=root / "team.json",
@@ -240,6 +274,7 @@ def ensure_inbox(p: FsPaths, agent: str) -> None:
     ip = inbox_path(p, agent)
     if not ip.exists():
         write_json(ip, {"agent": agent, "messages": []})
+        invalidate_mailbox_cache(ip)
 
 
 def mailbox_signal_path(p: FsPaths, agent: str) -> Path:
@@ -274,6 +309,7 @@ def clear_runtime_artifacts(p: FsPaths) -> None:
                     child.unlink()
                 except OSError:
                     pass
+                invalidate_mailbox_cache(child)
 
     if p.tasks.exists():
         for child in p.tasks.iterdir():
@@ -311,13 +347,29 @@ def clear_runtime_artifacts(p: FsPaths) -> None:
 
 def read_mailbox(p: FsPaths, agent: str) -> list[dict[str, Any]]:
     ensure_inbox(p, agent)
-    box = read_json(inbox_path(p, agent), {"agent": agent, "messages": []})
+    ip = inbox_path(p, agent)
+    cache_key = str(ip)
+    mtime_ns = -1
+    size = -1
+    try:
+        stat = ip.stat()
+        mtime_ns = int(stat.st_mtime_ns)
+        size = int(stat.st_size)
+    except OSError:
+        pass
+
+    cached = _MAILBOX_CACHE.get(cache_key)
+    if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+        return deep_copy(cached[2])
+
+    box = read_json(ip, {"agent": agent, "messages": []})
     msgs = box.get("messages", []) if isinstance(box, dict) else []
     out: list[dict[str, Any]] = []
     if isinstance(msgs, list):
         for m in msgs:
             if isinstance(m, dict):
                 out.append(m)
+    _MAILBOX_CACHE[cache_key] = (mtime_ns, size, deep_copy(out))
     return out
 
 
@@ -334,13 +386,17 @@ def write_mailbox(p: FsPaths, agent: str, message: dict[str, Any]) -> int:
         msg.setdefault("read", False)
         msgs.append(msg)
         idx = len(msgs) - 1
+    invalidate_mailbox_cache(ip)
     touch_mailbox_signal(p, agent)
     return idx
 
 
-def unread_indexed(p: FsPaths, agent: str) -> list[tuple[int, dict[str, Any]]]:
+def unread_indexed(p: FsPaths, agent: str, *, start_index: int = 0) -> list[tuple[int, dict[str, Any]]]:
+    floor = normalize_start_index(start_index)
     out: list[tuple[int, dict[str, Any]]] = []
     for idx, msg in enumerate(read_mailbox(p, agent)):
+        if idx < floor:
+            continue
         if not bool(msg.get("read", False)):
             out.append((idx, msg))
     return out
@@ -362,7 +418,12 @@ def mark_read(p: FsPaths, agent: str, indexes: Iterable[int], mark_all: bool) ->
                 if not bool(msg.get("read", False)):
                     msg["read"] = True
                     changed += 1
+    invalidate_mailbox_cache(ip)
     return changed
+
+
+def invalidate_mailbox_cache(path: Path) -> None:
+    _MAILBOX_CACHE.pop(str(path), None)
 
 
 def mailbox_read_indexed(
@@ -371,13 +432,22 @@ def mailbox_read_indexed(
     *,
     unread: bool,
     limit: int,
+    start_index: int = 0,
+    oldest_first: bool = False,
     mark_read_selected: bool,
 ) -> list[tuple[int, dict[str, Any]]]:
     ensure_inbox(p, agent)
+    floor = normalize_start_index(start_index)
     if not mark_read_selected:
-        values = unread_indexed(p, agent) if unread else list(enumerate(read_mailbox(p, agent)))
+        if unread:
+            values = unread_indexed(p, agent, start_index=floor)
+        else:
+            values = [(idx, msg) for idx, msg in enumerate(read_mailbox(p, agent)) if idx >= floor]
         if limit > 0:
-            values = values[-limit:]
+            if oldest_first or floor > 0:
+                values = values[:limit]
+            else:
+                values = values[-limit:]
         return values
 
     ip = inbox_path(p, agent)
@@ -389,14 +459,19 @@ def mailbox_read_indexed(
 
         values: list[tuple[int, dict[str, Any]]] = []
         for idx, msg in enumerate(msgs):
+            if idx < floor:
+                continue
             if not isinstance(msg, dict):
                 continue
             if unread and bool(msg.get("read", False)):
                 continue
             values.append((idx, deep_copy(msg)))
         if limit > 0:
-            # Oldest-first selection prevents starvation when unread backlog grows.
-            values = values[:limit]
+            if oldest_first or floor > 0:
+                # Oldest-first selection prevents starvation when unread backlog grows.
+                values = values[:limit]
+            else:
+                values = values[-limit:]
 
         selected_indexes = {idx for idx, _ in values}
         if selected_indexes:
@@ -406,6 +481,7 @@ def mailbox_read_indexed(
                 if not bool(msg.get("read", False)):
                     msg["read"] = True
 
+        invalidate_mailbox_cache(ip)
         return values
 
 
@@ -546,46 +622,7 @@ def resolve_control_response(
 
     req = reqs.get(request_id)
     if not isinstance(req, dict):
-        if not req_type_override:
-            raise SystemExit(f"request not found: {request_id}")
-        req_type = normalize_control_type(req_type_override)
-        status = "approved" if approve else "rejected"
-        response_body = body or status
-        recipient = recipient_override.strip() or lead_name(cfg)
-        # Compatibility fallback for legacy responders:
-        # emit response delivery, but never persist a synthetic control request.
-        deliver_message(
-            p,
-            cfg,
-            msg_type=f"{req_type}_response",
-            sender=responder,
-            recipient=recipient,
-            content=response_body,
-            summary="",
-            request_id=request_id,
-            approve=approve,
-            meta={
-                "request_id": request_id,
-                "req_type": req_type,
-                "approve": approve,
-                "state": status,
-                "synthetic": True,
-            },
-        )
-        return {
-            "request_id": request_id,
-            "req_type": req_type,
-            "sender": recipient,
-            "recipient": responder,
-            "body": "",
-            "summary": "",
-            "status": status,
-            "created_ts": "",
-            "updated_ts": utc_now_iso_ms(),
-            "response_body": response_body,
-            "responder": responder,
-            "synthetic": True,
-        }
+        raise SystemExit(f"request not found: {request_id}")
 
     if str(req.get("status", "")) != "pending":
         raise SystemExit(f"request already resolved: {request_id} status={req.get('status', '')}")
@@ -906,6 +943,8 @@ def deliver_message(
         raise SystemExit(f"unsupported message type: {msg_type}")
 
     all_names = [str(m.get("name", "")) for m in members(cfg) if m.get("name")]
+    if sender not in all_names and sender not in SYSTEM_ACTORS:
+        raise SystemExit(f"unknown sender: {sender}")
     targets: list[str]
     is_control_type = msg_type.endswith("_request") or msg_type.endswith("_response") or msg_type in {
         "shutdown_approved",
@@ -916,6 +955,10 @@ def deliver_message(
     else:
         if not recipient:
             raise SystemExit("recipient required for non-broadcast message")
+        if recipient == "all":
+            raise SystemExit("recipient 'all' is not allowed for control message types")
+        if recipient not in all_names and recipient not in SYSTEM_ACTORS:
+            raise SystemExit(f"unknown recipient: {recipient}")
         targets = [recipient]
 
     body = {
@@ -1185,6 +1228,8 @@ def cmd_mailbox_read(args: argparse.Namespace) -> int:
         args.agent,
         unread=bool(args.unread),
         limit=int(args.limit),
+        start_index=int(args.start_index),
+        oldest_first=bool(args.oldest_first),
         mark_read_selected=bool(args.mark_read),
     )
     if args.json:
@@ -1620,6 +1665,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", required=True)
     p.add_argument("--unread", action="store_true")
     p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--start-index", type=int, default=0)
+    p.add_argument("--oldest-first", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--mark-read", action="store_true")
     p.set_defaults(func=cmd_mailbox_read)

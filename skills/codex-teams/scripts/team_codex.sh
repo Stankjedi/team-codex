@@ -22,8 +22,11 @@ WORKERS=""
 MODEL=""
 DIRECTOR_MODEL=""
 WORKER_MODEL=""
+REVIEWER_MODEL=""
 DIRECTOR_PROFILE_OVERRIDE=""
 WORKER_PROFILE_OVERRIDE=""
+REVIEWER_PROFILE_OVERRIDE=""
+REVIEWER_NAME_OVERRIDE=""
 SESSION_OVERRIDE=""
 
 TEAM_NAME_OVERRIDE=""
@@ -33,6 +36,7 @@ DELETE_FORCE="false"
 
 TEAM_LEAD_NAME="lead"
 LEAD_AGENT_TYPE="team-lead"
+REVIEWER_AGENT_NAME="reviewer-1"
 TEAMMATE_MODE="in-process-shared"
 PERMISSION_MODE="default"
 PLAN_MODE_REQUIRED="false"
@@ -63,6 +67,7 @@ MESSAGE_APPROVE=""
 
 LEAD_MODEL=""
 LEAD_PROFILE=""
+REVIEWER_PROFILE=""
 GIT_BIN_OVERRIDE=""
 GIT_BIN=""
 BOOT_GIT_BIN="git"
@@ -82,6 +87,7 @@ declare -a TEAM_AGENT_NAMES=()
 declare -A TEAM_AGENT_ROLE=()
 declare -A TEAM_AGENT_PROFILE=()
 declare -A TEAM_AGENT_MODEL=()
+declare -A TEAM_AGENT_PERMISSION=()
 declare -A BOOT_PROMPT_BY_AGENT=()
 
 usage() {
@@ -106,7 +112,7 @@ Commands:
 Platform policy:
   - Windows host + WSL environment only
   - repository path must be under /mnt/<drive>/...
-  - fixed team topology: lead(external) + worker-1 + worker-2 + worker-3
+  - fixed team topology: lead(external) + reviewer-1 + worker-1 + worker-2 + worker-3
 
 Common options:
   --repo PATH             Target repo path (default: current directory, supports C:\... auto-convert)
@@ -116,9 +122,11 @@ Common options:
   --workers N             Worker count override (fixed policy: only `3` is accepted)
   --director-profile NAME Lead profile override (legacy flag name)
   --worker-profile NAME   Worker profile override
+  --reviewer-profile NAME Reviewer profile override
   --model MODEL           Set model for all roles
   --director-model MODEL  Lead model override (legacy flag name)
   --worker-model MODEL    Worker model override
+  --reviewer-model MODEL  Reviewer model override
   --git-bin PATH          Git binary override (default: git; supports C:\... auto-convert)
 
 Backend options:
@@ -141,6 +149,7 @@ init/teamcreate/teamdelete options:
   --team-name NAME        Team name override (default: session)
   --description TEXT      Team description
   --lead-name NAME        Team lead name (default: lead)
+  --reviewer-name NAME    Reviewer agent name (default: reviewer-1)
   --agent-type TYPE       Team lead agent type (default: team-lead)
   --force                 Overwrite existing config on init / force delete on teamdelete
   --replace               Overwrite existing team config on teamcreate
@@ -633,6 +642,23 @@ parse_bool_env() {
   esac
 }
 
+validate_session_name() {
+  local raw="${1:-}"
+  if [[ -z "$raw" ]]; then
+    abort "session is required"
+  fi
+  if [[ "$raw" == *"/"* || "$raw" == *"\\"* ]]; then
+    abort "invalid session name '$raw' (path separators are not allowed)"
+  fi
+  if [[ "$raw" == "." || "$raw" == ".." || "$raw" == *".."* ]]; then
+    abort "invalid session name '$raw'"
+  fi
+  if ! [[ "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    abort "invalid session name '$raw' (allowed: [A-Za-z0-9._-], max 128, starts with alnum)"
+  fi
+  printf '%s\n' "$raw"
+}
+
 is_teams_enabled() {
   local feature_flag="${CODEX_EXPERIMENTAL_AGENT_TEAMS:-${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-1}}"
   local gate_flag="${CODEX_TEAMS_GATE_TENGU_AMBER_FLINT:-${CLAUDE_CODE_STATSIG_TENGU_AMBER_FLINT:-1}}"
@@ -838,6 +864,8 @@ role_from_agent_name() {
   local agent="$1"
   case "$agent" in
     "$TEAM_LEAD_NAME") printf '%s\n' "lead" ;;
+    "$REVIEWER_AGENT_NAME") printf '%s\n' "reviewer" ;;
+    reviewer-*) printf '%s\n' "reviewer" ;;
     worker-*) printf '%s\n' "worker" ;;
     *) printf '%s\n' "worker" ;;
   esac
@@ -847,6 +875,7 @@ role_default_profile() {
   local role="$1"
   case "$role" in
     lead) printf '%s\n' "$LEAD_PROFILE" ;;
+    reviewer) printf '%s\n' "$REVIEWER_PROFILE" ;;
     worker) printf '%s\n' "$WORKER_PROFILE" ;;
     *) printf '%s\n' "$WORKER_PROFILE" ;;
   esac
@@ -856,8 +885,17 @@ role_default_model() {
   local role="$1"
   case "$role" in
     lead) printf '%s\n' "$LEAD_MODEL" ;;
+    reviewer) printf '%s\n' "$REVIEWER_MODEL" ;;
     worker) printf '%s\n' "$WORKER_MODEL" ;;
     *) printf '%s\n' "$WORKER_MODEL" ;;
+  esac
+}
+
+role_default_permission_mode() {
+  local role="$1"
+  case "$role" in
+    reviewer) printf '%s\n' "plan" ;;
+    *) printf '%s\n' "$PERMISSION_MODE" ;;
   esac
 }
 
@@ -867,6 +905,7 @@ role_peer_name() {
     worker-1) printf '%s\n' "worker-2" ;;
     worker-2) printf '%s\n' "worker-3" ;;
     worker-3) printf '%s\n' "worker-1" ;;
+    "$REVIEWER_AGENT_NAME") printf '%s\n' "$TEAM_LEAD_NAME" ;;
     *) printf '%s\n' "$TEAM_LEAD_NAME" ;;
   esac
 }
@@ -881,7 +920,14 @@ derive_role_team_shape() {
   TEAM_AGENT_ROLE=()
   TEAM_AGENT_PROFILE=()
   TEAM_AGENT_MODEL=()
+  TEAM_AGENT_PERMISSION=()
   BOOT_PROMPT_BY_AGENT=()
+
+  TEAM_AGENT_NAMES+=("$REVIEWER_AGENT_NAME")
+  TEAM_AGENT_ROLE["$REVIEWER_AGENT_NAME"]="reviewer"
+  TEAM_AGENT_PROFILE["$REVIEWER_AGENT_NAME"]="$(role_default_profile reviewer)"
+  TEAM_AGENT_MODEL["$REVIEWER_AGENT_NAME"]="$(role_default_model reviewer)"
+  TEAM_AGENT_PERMISSION["$REVIEWER_AGENT_NAME"]="$(role_default_permission_mode reviewer)"
 
   local i agent role
   for i in $(seq 1 "$WORKER_COUNT"); do
@@ -891,9 +937,10 @@ derive_role_team_shape() {
     TEAM_AGENT_ROLE["$agent"]="$role"
     TEAM_AGENT_PROFILE["$agent"]="$(role_default_profile "$role")"
     TEAM_AGENT_MODEL["$agent"]="$(role_default_model "$role")"
+    TEAM_AGENT_PERMISSION["$agent"]="$(role_default_permission_mode "$role")"
   done
 
-  TEAM_ROLE_SUMMARY="lead=1 worker=$WORKER_COUNT"
+  TEAM_ROLE_SUMMARY="lead=1 reviewer=1 worker=$WORKER_COUNT"
 }
 
 fs_cmd() {
@@ -910,9 +957,13 @@ load_config_or_defaults() {
   TMUX_SESSION="codex-fleet"
   KILL_EXISTING_SESSION="false"
   CODEX_BIN="codex"
-  DIRECTOR_PROFILE="director"
-  WORKER_PROFILE="pair"
-  LEAD_PROFILE="$DIRECTOR_PROFILE"
+  DIRECTOR_PROFILE="xhigh"
+  WORKER_PROFILE="high"
+  REVIEWER_PROFILE="xhigh"
+  LEAD_PROFILE=""
+  LEAD_MODEL="gpt-5.3-codex"
+  WORKER_MODEL="gpt-5.3-codex"
+  REVIEWER_MODEL="gpt-5.3-codex-spark"
   MERGE_STRATEGY="merge"
   TEAMMATE_MODE="in-process-shared"
   PERMISSION_MODE="default"
@@ -937,6 +988,13 @@ load_config_or_defaults() {
     source "$CONFIG"
   fi
 
+  if [[ -n "${REVIEWER_NAME:-}" ]]; then
+    REVIEWER_AGENT_NAME="$REVIEWER_NAME"
+  fi
+  if [[ -n "$REVIEWER_NAME_OVERRIDE" ]]; then
+    REVIEWER_AGENT_NAME="$REVIEWER_NAME_OVERRIDE"
+  fi
+
   if [[ -z "$TEAM_NAME_OVERRIDE" ]]; then
     if [[ -n "${CODEX_TEAM_NAME:-}" ]]; then
       TEAM_NAME_OVERRIDE="$CODEX_TEAM_NAME"
@@ -958,9 +1016,13 @@ load_config_or_defaults() {
 
   if [[ -n "$DIRECTOR_PROFILE_OVERRIDE" ]]; then
     DIRECTOR_PROFILE="$DIRECTOR_PROFILE_OVERRIDE"
+    LEAD_PROFILE="$DIRECTOR_PROFILE_OVERRIDE"
   fi
   if [[ -n "$WORKER_PROFILE_OVERRIDE" ]]; then
     WORKER_PROFILE="$WORKER_PROFILE_OVERRIDE"
+  fi
+  if [[ -n "$REVIEWER_PROFILE_OVERRIDE" ]]; then
+    REVIEWER_PROFILE="$REVIEWER_PROFILE_OVERRIDE"
   fi
   if [[ -n "$SESSION_OVERRIDE" ]]; then
     TMUX_SESSION="$SESSION_OVERRIDE"
@@ -980,6 +1042,16 @@ load_config_or_defaults() {
   if [[ -n "$GIT_BIN_OVERRIDE" ]]; then
     GIT_BIN="$GIT_BIN_OVERRIDE"
   fi
+  TMUX_SESSION="$(validate_session_name "$TMUX_SESSION")"
+  if [[ -z "$REVIEWER_AGENT_NAME" ]]; then
+    abort "reviewer agent name is required"
+  fi
+  if [[ "$REVIEWER_AGENT_NAME" == "$TEAM_LEAD_NAME" ]]; then
+    abort "reviewer agent name must differ from lead name"
+  fi
+  if ! [[ "$REVIEWER_AGENT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    abort "invalid reviewer name '$REVIEWER_AGENT_NAME' (allowed: [A-Za-z0-9._-], max 128, starts with alnum)"
+  fi
   GIT_BIN="$(normalize_git_bin_path "$GIT_BIN")"
 
   if [[ -z "$LEAD_PROFILE" ]]; then
@@ -987,7 +1059,7 @@ load_config_or_defaults() {
   fi
   if [[ -n "$WORKERS" ]]; then
     if [[ "$WORKERS" != "3" ]]; then
-      abort "--workers is fixed at 3 in external-lead topology"
+      abort "--workers is fixed at 3 in external-lead + reviewer topology"
     fi
     COUNT="3"
   fi
@@ -996,6 +1068,7 @@ load_config_or_defaults() {
     DIRECTOR_MODEL="$MODEL"
     WORKER_MODEL="$MODEL"
     LEAD_MODEL="$MODEL"
+    REVIEWER_MODEL="$MODEL"
   fi
 
   if [[ -n "$DIRECTOR_MODEL" && -z "$LEAD_MODEL" ]]; then
@@ -1011,9 +1084,15 @@ load_config_or_defaults() {
   if [[ -z "$WORKER_MODEL" ]]; then
     WORKER_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role worker --profile "$WORKER_PROFILE" 2>/dev/null || true)"
   fi
+  if [[ -z "$REVIEWER_MODEL" ]]; then
+    REVIEWER_MODEL="$(python3 "$MODEL_RESOLVER" --project-root "$REPO" --role reviewer --profile "$REVIEWER_PROFILE" 2>/dev/null || true)"
+  fi
 
   if [[ -z "$LEAD_MODEL" ]]; then
     LEAD_MODEL="$DIRECTOR_MODEL"
+  fi
+  if [[ -z "$REVIEWER_MODEL" ]]; then
+    REVIEWER_MODEL="$WORKER_MODEL"
   fi
 
   if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
@@ -1093,6 +1172,46 @@ for m in cfg.get("members", []):
 PY
 }
 
+is_system_actor() {
+  local ident="${1:-}"
+  case "$ident" in
+    system|monitor|orchestrator)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_known_team_member() {
+  local ident="${1:-}"
+  if [[ -z "$ident" ]]; then
+    return 1
+  fi
+  if is_system_actor "$ident"; then
+    return 0
+  fi
+  fs_member_names | grep -Fxq "$ident"
+}
+
+validate_sendmessage_participants() {
+  local sender="$1"
+  local recipient="$2"
+
+  if ! is_known_team_member "$sender"; then
+    abort "unknown sender: $sender"
+  fi
+
+  if [[ -z "$recipient" || "$recipient" == "all" ]]; then
+    return 0
+  fi
+
+  if ! is_known_team_member "$recipient"; then
+    abort "unknown recipient: $recipient"
+  fi
+}
+
 register_team_members() {
   python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "system" --role "system" >/dev/null
   python3 "$BUS" --db "$DB" register --room "$ROOM" --agent "orchestrator" --role "orchestrator" >/dev/null
@@ -1132,29 +1251,37 @@ create_or_refresh_team_context() {
 
   local worker_backend="$RESOLVED_BACKEND"
 
-  local worker
-  for worker in "${TEAM_AGENT_NAMES[@]}"; do
-    local wt_path="$WORKTREES_ROOT/$worker"
-    local role="${TEAM_AGENT_ROLE[$worker]}"
-    local model="${TEAM_AGENT_MODEL[$worker]}"
-    local profile="${TEAM_AGENT_PROFILE[$worker]}"
+  local agent_name
+  for agent_name in "${TEAM_AGENT_NAMES[@]}"; do
+    local role="${TEAM_AGENT_ROLE[$agent_name]}"
+    local wt_path="$WORKTREES_ROOT/$agent_name"
+    local member_cwd="$wt_path"
+    if [[ "$role" != "worker" ]]; then
+      member_cwd="$REPO"
+    fi
+    local model="${TEAM_AGENT_MODEL[$agent_name]}"
+    local profile="${TEAM_AGENT_PROFILE[$agent_name]}"
+    local member_mode="${TEAM_AGENT_PERMISSION[$agent_name]}"
     if [[ -z "$model" ]]; then
       model="$WORKER_MODEL"
     fi
     if [[ -z "$profile" ]]; then
       profile="$WORKER_PROFILE"
     fi
+    if [[ -z "$member_mode" ]]; then
+      member_mode="$PERMISSION_MODE"
+    fi
     local args=(
       member-add
       --repo "$REPO"
       --session "$TMUX_SESSION"
-      --name "$worker"
+      --name "$agent_name"
       --agent-type "$role"
       --model "$model"
       --prompt ""
-      --cwd "$wt_path"
+      --cwd "$member_cwd"
       --backend-type "$worker_backend"
-      --mode "$RESOLVED_BACKEND"
+      --mode "$member_mode"
     )
     if [[ "$PLAN_MODE_REQUIRED" == "true" ]]; then
       args+=(--plan-mode-required)
@@ -1201,6 +1328,9 @@ ensure_worktrees() {
   local name
   local worktree_targets=("${TEAM_AGENT_NAMES[@]}")
   for name in "${worktree_targets[@]}"; do
+    if [[ "${TEAM_AGENT_ROLE[$name]}" != "worker" ]]; then
+      continue
+    fi
     local branch="ma/$name"
     local wt_path="$WORKTREES_ROOT/$name"
     local wt_path_for_git
@@ -1302,6 +1432,10 @@ spawn_inprocess_shared_backend() {
     --lead-cwd "$REPO"
     --lead-profile "$LEAD_PROFILE"
     --lead-model "$LEAD_MODEL"
+    --reviewer-name "$REVIEWER_AGENT_NAME"
+    --reviewer-profile "${TEAM_AGENT_PROFILE[$REVIEWER_AGENT_NAME]}"
+    --reviewer-model "${TEAM_AGENT_MODEL[$REVIEWER_AGENT_NAME]}"
+    --reviewer-permission-mode "${TEAM_AGENT_PERMISSION[$REVIEWER_AGENT_NAME]}"
     --codex-bin "$CODEX_BIN"
     --poll-ms "$INPROCESS_POLL_MS"
     --idle-ms "$INPROCESS_IDLE_MS"
@@ -1357,6 +1491,9 @@ role_primary_objective() {
     worker)
       printf '%s\n' "Implement scoped code changes with minimal blast radius and provide concrete validation output."
       ;;
+    reviewer)
+      printf '%s\n' "Perform independent review only (no code changes) and report concrete findings with severity and evidence."
+      ;;
     *)
       printf '%s\n' "Execute assigned scope and provide auditable evidence."
       ;;
@@ -1380,6 +1517,14 @@ build_role_task_prompt() {
 8. If anything is unknown mid-task, ask lead immediately with \`question\` (summary: research-request); do not guess critical requirements.
 9. If lead assigns merge/release ownership, execute it using configured git binary: \`"$GIT_BIN"\`.
 10. You decide completion for your assigned scope. When you judge it done, explicitly send \`status\` with summary \`done\` to lead and include changed files + validation evidence.
+11. Treat other workers as first-class collaborators: request peer review with \`question\`, respond with \`answer\`, and send \`message\` summary \`peer-sync\` when interface/contracts changed.
+EOF
+)"
+  elif [[ "$role" == "reviewer" ]]; then
+    role_specific_contract="$(cat <<EOF
+7. Reviewer is review-only: do not edit files, do not run write operations, do not commit.
+8. Review must include severity-ranked findings with exact file paths/lines and reproduction/verification evidence.
+9. Send final review to lead using \`status\` summary \`review-done\` and include explicit \`result=pass|issues\`.
 EOF
 )"
   fi
@@ -1418,16 +1563,18 @@ $task_text
 Operating policy:
 1. Perform requirement analysis and research synthesis.
 2. Produce a concrete execution plan.
-3. Operate fixed runtime topology: worker-1, worker-2, worker-3 (no worker scaling).
-4. Delegate implementation tasks to worker-* agents.
+3. Operate fixed runtime topology: $REVIEWER_AGENT_NAME + worker-1 + worker-2 + worker-3 (workers are fixed at 3).
+4. Delegate code implementation tasks only to worker-* agents.
 5. Active feedback loop is mandatory: for every worker status/blocker/question, send explicit feedback with next action, priority, and owner.
 6. Mailbox reads are mention-driven: react when teammate mentions/updates arrive instead of blind polling loops.
 7. Worker completion is worker-declared: treat worker \`status\` summary \`done\` as completion signal for that worker scope.
-8. Start final lead review only after all worker-* scopes are reported done.
-9. If review finds follow-up work, either delegate additional tasks to worker-* or directly implement targeted fixes yourself.
-10. Assign one worker for final git push/merge workflow after review approval.
-11. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
-12. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
+8. After all worker scopes are done, run independent lead review and request $REVIEWER_AGENT_NAME independent review.
+9. Compare lead review vs reviewer review. If issues exist, synthesize a remediation plan and re-delegate fixes to worker-*.
+10. Lead must remain orchestration/debug owner; do not implement feature code directly.
+11. Assign one worker for final git push/merge workflow after all review issues are closed.
+12. If any worker asks \`question\` with unknowns, run focused research (repo + web/docs as needed) and send refined guidance back as follow-up \`task\` or \`answer\`.
+13. For each unanswered worker question/blocker, assign owner + deadline and keep follow-up until closed.
+14. Keep worker mesh active: require each worker to share peer-sync updates for cross-cutting changes and ensure at least one peer review touchpoint per worker scope.
 EOF
 }
 
@@ -1453,7 +1600,7 @@ prepare_initial_boot_prompts() {
 
 announce_collaboration_workflow() {
   local workflow_summary
-  workflow_summary="workflow-fixed lead-research+plan->delegate->peer-qa(continuous)->on-demand-research-by-lead->feedback-loop(lead<->workers)->lead-review->assigned-worker-push/merge; lead=orchestration-only(external-session); unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=fixed-worker-pool-3"
+  workflow_summary="workflow-fixed lead-research+plan->delegate(workers)->peer-qa(continuous)+peer-sync(auto)->on-demand-research-by-lead->worker-complete->parallel-review(lead+reviewer)->review-compare->issue-redelegate(if-needed)->assigned-worker-push/merge; lead=orchestration/debug-only(external-session); reviewer=review-only(no-code-edit); unknowns=worker-question->lead-research->worker-answer/task; role-shape=[$TEAM_ROLE_SUMMARY]; policy=fixed-worker-pool-3+$REVIEWER_AGENT_NAME"
   python3 "$BUS" --db "$DB" send --room "$ROOM" --from orchestrator --to all --kind status --body "$workflow_summary" >/dev/null
   fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from orchestrator --recipient all --summary "workflow-fixed" --content "$workflow_summary" >/dev/null || true
 }
@@ -1466,6 +1613,13 @@ delegate_initial_task_to_role_agents() {
   for agent in "${TEAM_AGENT_NAMES[@]}"; do
     i=$((i + 1))
     local role="${TEAM_AGENT_ROLE[$agent]}"
+    if [[ "$role" == "reviewer" ]]; then
+      local reviewer_hold
+      reviewer_hold="reviewer standby: wait until workers complete; then perform independent review-only pass and report findings to $TEAM_LEAD_NAME."
+      fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type status --from "$TEAM_LEAD_NAME" --recipient "$agent" --content "$reviewer_hold" --summary "reviewer-standby" >/dev/null
+      python3 "$BUS" --db "$DB" send --room "$ROOM" --from "$TEAM_LEAD_NAME" --to "$agent" --kind status --body "$reviewer_hold" >/dev/null
+      continue
+    fi
     local delegated
     delegated="$(build_role_task_prompt "$agent" "$role" "$i" "$total" "$task_text")"
     fs_cmd dispatch --repo "$REPO" --session "$TMUX_SESSION" --type task --from "$TEAM_LEAD_NAME" --recipient "$agent" --content "$delegated" --summary "delegated-initial-task-$agent" >/dev/null
@@ -1504,9 +1658,10 @@ print_start_summary() {
   local total_members=$(( ${#TEAM_AGENT_NAMES[@]} + 1 ))
   local runtime_members="${#TEAM_AGENT_NAMES[@]}"
   echo "- role members: $total_members ($TEAM_ROLE_SUMMARY)"
-  echo "- runtime members: $runtime_members (workers only)"
+  echo "- runtime members: $runtime_members (reviewer + workers)"
   echo "- lead runtime: external (current codex session)"
   echo "- lead cwd: $LEAD_WORKTREE"
+  echo "- reviewer: $REVIEWER_AGENT_NAME (read-only review)"
   echo "- worker pool: $WORKER_COUNT"
   echo "- auto delegate: $AUTO_DELEGATE"
   echo "- room: $ROOM"
@@ -1515,8 +1670,8 @@ print_start_summary() {
   echo "- team config: $TEAM_CONFIG"
   echo "- state: $TEAM_ROOT/state.json"
   echo "- viewer bridge: $REPO/$VIEWER_BRIDGE_FILE"
-  if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" ]]; then
-    echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>}"
+  if [[ -n "$LEAD_MODEL" || -n "$WORKER_MODEL" || -n "$REVIEWER_MODEL" ]]; then
+    echo "- models: lead=${LEAD_MODEL:-<default>} worker=${WORKER_MODEL:-<default>} reviewer=${REVIEWER_MODEL:-<default>}"
   fi
   echo "- logs: $LOG_DIR/inprocess-hub.log"
   echo "- in-process poll(ms): $INPROCESS_POLL_MS"
@@ -1837,13 +1992,16 @@ ensure_default_project_config() {
   cat > "$config_path" <<'EOF'
 #!/usr/bin/env bash
 # Project config for codex multi-agent orchestration.
-# Topology is fixed by codex-teams runtime: lead(external) x1 + worker x3.
+# Topology is fixed by codex-teams runtime: lead(external) x1 + reviewer x1 + worker x3.
 
 # Number of workers (fixed policy).
 COUNT=3
 
 # Worker naming prefix: worker-1, worker-2, worker-3
 PREFIX="worker"
+
+# Fixed reviewer agent name.
+REVIEWER_NAME="reviewer-1"
 
 # Where worker worktrees are created (relative to repo root or absolute path).
 WORKTREES_DIR=".worktrees"
@@ -1863,8 +2021,14 @@ KILL_EXISTING_SESSION="false"
 
 # Codex executable and profiles.
 CODEX_BIN="codex"
-DIRECTOR_PROFILE="director"
-WORKER_PROFILE="pair"
+DIRECTOR_PROFILE="xhigh"
+WORKER_PROFILE="high"
+REVIEWER_PROFILE="xhigh"
+
+# Role model defaults.
+LEAD_MODEL="gpt-5.3-codex"
+WORKER_MODEL="gpt-5.3-codex"
+REVIEWER_MODEL="gpt-5.3-codex-spark"
 
 # Merge mode when integrating workers: merge or cherry-pick
 MERGE_STRATEGY="merge"
@@ -2052,6 +2216,9 @@ cmd_merge() {
   local attempted_count=0
   local agent
   for agent in "${TEAM_AGENT_NAMES[@]}"; do
+    if [[ "${TEAM_AGENT_ROLE[$agent]}" != "worker" ]]; then
+      continue
+    fi
     local branch="ma/$agent"
     if ! git_repo_cmd "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
       echo "skip missing branch: $branch"
@@ -2281,6 +2448,8 @@ cmd_sendmessage() {
     fi
   fi
 
+  validate_sendmessage_participants "$MESSAGE_SENDER" "$recipient"
+
   case "$msg_type" in
     message|broadcast|task|question|answer|status|blocker|system)
       if [[ "$msg_type" != "broadcast" && -z "$recipient" ]]; then
@@ -2304,13 +2473,6 @@ print(uuid.uuid4().hex[:12])
 PY
 )"
       fi
-      if [[ -f "$DB" ]]; then
-        local bus_rid
-        bus_rid="$(bus_control_request "$req_type" "$MESSAGE_SENDER" "$recipient" "$body" "$summary" "$rid" || true)"
-        if [[ -n "$bus_rid" ]]; then
-          rid="$bus_rid"
-        fi
-      fi
       local fs_rid
       fs_rid="$(fs_control_request "$req_type" "$MESSAGE_SENDER" "$recipient" "$body" "$summary" "$rid" || true)"
       if [[ -n "$fs_rid" ]]; then
@@ -2320,6 +2482,17 @@ PY
         fs_req_info="$(fs_lookup_request_fields "$rid" || true)"
         if [[ "$fs_req_info" == "||" || -z "$fs_req_info" ]]; then
           abort "control request persistence failed for request_id=$rid type=$req_type; refusing orphan request dispatch"
+        fi
+      fi
+      if [[ -f "$DB" ]]; then
+        local bus_rid
+        bus_rid="$(bus_control_request "$req_type" "$MESSAGE_SENDER" "$recipient" "$body" "$summary" "$rid" || true)"
+        if [[ -n "$bus_rid" ]]; then
+          if [[ "$bus_rid" != "$rid" ]]; then
+            abort "control request id mismatch fs=$rid db=$bus_rid type=$req_type"
+          fi
+        else
+          echo "warn: bus control request persistence failed request_id=$rid type=$req_type (fs persisted)" >&2
         fi
       fi
       echo "request_id=$rid"
@@ -2364,6 +2537,7 @@ PY
           recipient="$TEAM_LEAD_NAME"
         fi
       fi
+      validate_sendmessage_participants "$MESSAGE_SENDER" "$recipient"
 
       local response_req_type="$req_type"
       if [[ -z "$response_req_type" ]]; then
@@ -2461,6 +2635,10 @@ parse_args() {
         WORKER_MODEL="$2"
         shift 2
         ;;
+      --reviewer-model)
+        REVIEWER_MODEL="$2"
+        shift 2
+        ;;
       --git-bin)
         GIT_BIN_OVERRIDE="$2"
         shift 2
@@ -2471,6 +2649,10 @@ parse_args() {
         ;;
       --worker-profile)
         WORKER_PROFILE_OVERRIDE="$2"
+        shift 2
+        ;;
+      --reviewer-profile)
+        REVIEWER_PROFILE_OVERRIDE="$2"
         shift 2
         ;;
       --session)
@@ -2493,6 +2675,11 @@ parse_args() {
         ;;
       --lead-name)
         TEAM_LEAD_NAME="$2"
+        shift 2
+        ;;
+      --reviewer-name)
+        REVIEWER_AGENT_NAME="$2"
+        REVIEWER_NAME_OVERRIDE="$2"
         shift 2
         ;;
       --agent-type)

@@ -4,6 +4,7 @@
 이 저장소 버전은 **Windows + WSL 전용**이고, 기본적으로 아래 형태로 동작합니다.
 
 - 리더: 현재 Codex IDE 채팅 세션(외부 리더)
+- 리뷰어: `reviewer-1` (리뷰 전용, 코드 수정 금지)
 - 워커: `worker-1`, `worker-2`, `worker-3` (고정 3명)
 - 유일 런타임: `in-process-shared` (리소스 절약형)
 - 독립 실행: `codex-teams` 단독으로 동작
@@ -132,6 +133,7 @@ codex-teams sendmessage --repo <repo> --session <session> \
 
 - `in-process-shared` 단일 런타임만 지원합니다.
 - `--teammate-mode auto`는 호환성 별칭으로 `in-process-shared`로 정규화됩니다.
+- 기본 운영 흐름: `lead 계획/위임 -> worker 구현 -> lead+reviewer 독립 리뷰 -> 대조 후 이슈 재위임 -> 이슈 없으면 완료`.
 
 예시:
 
@@ -153,6 +155,14 @@ codex-teams init --repo <repo>
 ```bash
 # 워커 수는 고정 3 (다른 값 불가)
 COUNT=3
+
+# 역할별 기본 프로필/모델
+DIRECTOR_PROFILE="xhigh"
+WORKER_PROFILE="high"
+REVIEWER_PROFILE="xhigh"
+LEAD_MODEL="gpt-5.3-codex"
+WORKER_MODEL="gpt-5.3-codex"
+REVIEWER_MODEL="gpt-5.3-codex-spark"
 
 # 유일 실행 모드
 TEAMMATE_MODE="in-process-shared"
@@ -178,6 +188,7 @@ CODEX_TEAM_GIT_BIN="$GIT_BIN"
 
 - `--workers`는 `3`만 허용됩니다.
 - 기본 리더는 현재 Codex 세션(외부 리더)입니다.
+- 기본 리뷰어는 `reviewer-1`이며 read-only review 루프를 담당합니다.
 - `TEAMMATE_MODE`는 `in-process-shared`만 지원됩니다.
 
 ## 7. 결과 파일 위치

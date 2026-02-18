@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Project config for codex multi-agent orchestration.
-# Topology is fixed by codex-teams runtime: lead(external) x1 + worker x3.
+# Topology is fixed by codex-teams runtime: lead(external) x1 + reviewer x1 + worker x3.
 
 # Number of workers (fixed policy: 3)
 COUNT=3
 PREFIX="worker"
+REVIEWER_NAME="reviewer-1"
 
 # Where worker worktrees are created (relative to repo root or absolute path).
 WORKTREES_DIR=".worktrees"
@@ -24,8 +25,14 @@ KILL_EXISTING_SESSION="false"
 
 # Codex executable and profiles.
 CODEX_BIN="codex"
-DIRECTOR_PROFILE="director"
-WORKER_PROFILE="pair"
+DIRECTOR_PROFILE="xhigh"
+WORKER_PROFILE="high"
+REVIEWER_PROFILE="xhigh"
+
+# Role model defaults.
+LEAD_MODEL="gpt-5.3-codex"
+WORKER_MODEL="gpt-5.3-codex"
+REVIEWER_MODEL="gpt-5.3-codex-spark"
 
 # Merge mode when integrating workers: merge or cherry-pick
 MERGE_STRATEGY="merge"

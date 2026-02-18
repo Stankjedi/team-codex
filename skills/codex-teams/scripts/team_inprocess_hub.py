@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -29,17 +29,19 @@ import team_inprocess_agent as agent_loop  # noqa: E402
 
 STOP = False
 STOP_SIGNAL = ""
-DONE_KEYWORDS = {"done", "complete", "completed", "finish", "finished", "resolved", "fixed"}
-DONE_NEGATIVE_MARKERS = {"not done", "in progress", "wip", "todo", "incomplete"}
 MAX_CAPTURE_BYTES = 200_000
 MAX_DRAIN_BYTES_PER_TICK = 64_000
 MAX_DRAIN_CHUNKS_PER_TICK = 16
 WORKER_MAILBOX_BATCH = 200
-LEAD_DONE_SCAN_BATCH = 500
+LEAD_MAILBOX_SCAN_BATCH = 500
 MAX_PROMPT_MESSAGES_PER_RUN = 8
 MAX_PROMPT_CHARS_PER_RUN = 12_000
 ACTIVE_LOOP_SLEEP_SEC = 0.02
 FAST_LOOP_SLEEP_SEC = 0.05
+FS_CMD_RETRIES = 2
+BUS_CMD_RETRIES = 3
+CMD_RETRY_BASE_SEC = 0.08
+HUB_LIFECYCLE_LOG = ""
 
 
 @dataclass
@@ -49,7 +51,9 @@ class WorkerState:
     prompt_prefix: str
     pending_texts: list[str] = field(default_factory=list)
     pending_indexes: list[int] = field(default_factory=list)
+    pending_index_set: set[int] = field(default_factory=set)
     pending_targets: dict[str, set[str]] = field(default_factory=dict)
+    mailbox_scan_index: int = 0
     last_activity: int = 0
     last_idle_sent: int = 0
     last_mention_token: int = 0
@@ -76,9 +80,13 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def role_from_agent_name(name: str, lead_name: str = "lead") -> str:
+def role_from_agent_name(name: str, lead_name: str = "lead", reviewer_name: str = "reviewer-1") -> str:
     if name == lead_name:
         return "lead"
+    if name == reviewer_name:
+        return "reviewer"
+    if name.startswith("reviewer-"):
+        return "reviewer"
     if name.startswith("worker-"):
         return "worker"
     if name.startswith("utility-"):
@@ -138,26 +146,110 @@ def write_heartbeat(heartbeat_path: str, payload: dict[str, object]) -> None:
 
 def fs_cmd(fs_path: Path, args: list[str]) -> tuple[int, str]:
     cmd = [sys.executable, str(fs_path), *args]
-    proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    return proc.returncode, proc.stdout or ""
+    return _run_py_cmd(
+        cmd,
+        retries=FS_CMD_RETRIES,
+        retry_delay=CMD_RETRY_BASE_SEC,
+        source="fs",
+    )
 
 
-def bus_cmd(bus_path: Path, db_path: Path, args: list[str]) -> None:
+def bus_cmd(bus_path: Path, db_path: Path, args: list[str]) -> tuple[int, str]:
     cmd = [sys.executable, str(bus_path), "--db", str(db_path), *args]
-    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return _run_py_cmd(
+        cmd,
+        retries=BUS_CMD_RETRIES,
+        retry_delay=CMD_RETRY_BASE_SEC,
+        source="bus",
+    )
+
+
+def _format_cmd(parts: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _run_py_cmd(
+    cmd: list[str],
+    *,
+    retries: int,
+    retry_delay: float,
+    source: str,
+) -> tuple[int, str]:
+    max_attempts = max(1, retries + 1)
+    out = ""
+    rc = 0
+    for attempt in range(1, max_attempts + 1):
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        rc = int(proc.returncode)
+        out = proc.stdout or ""
+        if rc == 0:
+            return 0, out
+        if attempt < max_attempts:
+            time.sleep(retry_delay * attempt)
+    snippet = " ".join(out.strip().splitlines()[-3:])[:500]
+    append_lifecycle(
+        HUB_LIFECYCLE_LOG,
+        f"{source}-cmd-failed rc={rc} attempts={max_attempts} cmd={_format_cmd(cmd)} output={snippet}",
+    )
+    return rc, out
 
 
 def load_unread_messages(paths: team_fs.FsPaths, worker: WorkerState, *, limit: int) -> list[dict]:
+    start_index = worker.mailbox_scan_index
     try:
         values = team_fs.mailbox_read_indexed(
             paths,
             worker.args.agent,
             unread=True,
             limit=limit,
+            start_index=start_index,
+            oldest_first=True,
             mark_read_selected=False,
         )
     except Exception:
         return []
+
+    if not values and start_index > 0:
+        # Resync when older unread rows still exist (e.g., partial ack failure/race).
+        try:
+            oldest_unread = team_fs.mailbox_read_indexed(
+                paths,
+                worker.args.agent,
+                unread=True,
+                limit=1,
+                start_index=0,
+                oldest_first=True,
+                mark_read_selected=False,
+            )
+        except Exception:
+            oldest_unread = []
+        if oldest_unread:
+            oldest_idx = oldest_unread[0][0]
+            if isinstance(oldest_idx, int) and 0 <= oldest_idx < start_index:
+                worker.mailbox_scan_index = oldest_idx
+                try:
+                    values = team_fs.mailbox_read_indexed(
+                        paths,
+                        worker.args.agent,
+                        unread=True,
+                        limit=limit,
+                        start_index=worker.mailbox_scan_index,
+                        oldest_first=True,
+                        mark_read_selected=False,
+                    )
+                except Exception:
+                    return []
+
+    if values:
+        max_seen = max(idx for idx, _ in values if isinstance(idx, int))
+        if max_seen + 1 > worker.mailbox_scan_index:
+            worker.mailbox_scan_index = max_seen + 1
 
     rows: list[dict] = []
     for idx, row in values:
@@ -175,72 +267,54 @@ def load_unread_messages_no_mark(
     start_index: int = 0,
 ) -> list[dict]:
     try:
-        mailbox = team_fs.read_mailbox(paths, agent)
+        values = team_fs.mailbox_read_indexed(
+            paths,
+            agent,
+            unread=True,
+            limit=limit,
+            start_index=start_index,
+            oldest_first=True,
+            mark_read_selected=False,
+        )
     except Exception:
         return []
 
     rows: list[dict] = []
-    for idx, row in enumerate(mailbox):
-        if idx < start_index:
-            continue
+    for idx, row in values:
         if not isinstance(row, dict):
             continue
-        if bool(row.get("read", False)):
-            continue
         rows.append({"index": idx, **row})
-        if limit > 0 and len(rows) >= limit:
-            break
     return rows
 
 
-def text_indicates_done(raw: str) -> bool:
-    text = str(raw or "").strip().lower()
-    if not text:
+def worker_index_inflight(worker: WorkerState, idx: int) -> bool:
+    if idx < 0:
         return False
-    for marker in DONE_NEGATIVE_MARKERS:
-        if marker in text:
-            return False
-    tokens = [tok for tok in re.split(r"[^a-z0-9]+", text) if tok]
-    if not tokens:
-        return False
-    return any(tok in DONE_KEYWORDS for tok in tokens)
-
-
-def worker_message_reports_done(message: dict) -> bool:
-    msg_type = str(message.get("type", "")).strip()
-    if msg_type in {"task", "question", "blocker", "shutdown_request"}:
-        return False
-    summary = str(message.get("summary", ""))
-    text = str(message.get("text", ""))
-    if text_indicates_done(summary):
+    if idx in worker.pending_index_set:
         return True
-    if msg_type in {"status", "message", "answer"} and text_indicates_done(text):
-        return True
-    return False
+    return idx in worker.active_indexes
 
 
-def trim_seen_indexes(seen: set[int], *, keep: int = 6000) -> None:
-    if len(seen) <= keep:
-        return
-    max_idx = max(seen)
-    floor = max(0, max_idx - keep)
-    stale = [idx for idx in seen if idx < floor]
-    for idx in stale:
-        seen.discard(idx)
-
-
-def mark_worker_indexes_read(paths: team_fs.FsPaths, worker: WorkerState, indexes: list[int]) -> None:
+def mark_worker_indexes_read(paths: team_fs.FsPaths, worker: WorkerState, indexes: list[int]) -> bool:
     if not indexes:
-        return
+        return True
     unique = sorted({idx for idx in indexes if isinstance(idx, int) and idx >= 0})
     if not unique:
-        return
+        return True
     try:
         marked = team_fs.mark_read(paths, worker.args.agent, indexes=unique, mark_all=False)
     except Exception:
         marked = 0
-    if marked < len(unique):
+    ok = marked >= len(unique)
+    if not ok:
         worker.force_mailbox_check = True
+        worker.mailbox_scan_index = 0
+    return ok
+
+
+def has_unread_messages(paths: team_fs.FsPaths, agent: str) -> bool:
+    rows = load_unread_messages_no_mark(paths, agent, limit=1, start_index=0)
+    return bool(rows)
 
 
 def pop_worker_prompt_batch(worker: WorkerState) -> tuple[list[str], list[int]]:
@@ -256,7 +330,10 @@ def pop_worker_prompt_batch(worker: WorkerState) -> tuple[list[str], list[int]]:
         lines.append(worker.pending_texts.pop(0))
         total_chars = projected
         if worker.pending_indexes:
-            indexes.append(worker.pending_indexes.pop(0))
+            msg_idx = worker.pending_indexes.pop(0)
+            indexes.append(msg_idx)
+            if isinstance(msg_idx, int) and msg_idx >= 0:
+                worker.pending_index_set.discard(msg_idx)
         if total_chars >= MAX_PROMPT_CHARS_PER_RUN:
             break
 
@@ -315,6 +392,10 @@ def all_workers_review_ready(workers: list[WorkerState], worker_done: dict[str, 
             return False
         if worker.pending_texts:
             return False
+        if worker.pending_indexes or worker.pending_index_set:
+            return False
+        if worker.force_mailbox_check:
+            return False
     return True
 
 
@@ -327,14 +408,15 @@ def notify_review_ready(
     session: str,
     room: str,
     lead: str,
+    reviewers: list[str],
     worker_done: dict[str, bool],
 ) -> None:
     done_workers = [name for name, done in worker_done.items() if done]
     done_workers.sort()
     body = (
-        "all worker-* agents reported task completion. "
-        f"ready for lead final review. workers={','.join(done_workers)} "
-        "if review finds follow-up work, delegate extra tasks or patch directly."
+        "all worker-* agents are runtime-complete (last run successful, queue drained). "
+        f"ready for independent lead+reviewer review. workers={','.join(done_workers)} "
+        "if any issue is found, synthesize remediation and re-delegate fixes to workers."
     )
     bus_cmd(
         bus_path,
@@ -373,6 +455,49 @@ def notify_review_ready(
             body,
         ],
     )
+    for reviewer in reviewers:
+        reviewer_prompt = (
+            "review-only mission: workers are complete. "
+            "Review worker changes independently. Do not modify files. "
+            "Report findings to lead with severity/file:line evidence and conclude with result=pass|issues."
+        )
+        bus_cmd(
+            bus_path,
+            db_path,
+            [
+                "send",
+                "--room",
+                room,
+                "--from",
+                "system",
+                "--to",
+                reviewer,
+                "--kind",
+                "task",
+                "--body",
+                reviewer_prompt,
+            ],
+        )
+        fs_cmd(
+            fs_path,
+            [
+                "dispatch",
+                "--repo",
+                repo,
+                "--session",
+                session,
+                "--type",
+                "task",
+                "--from",
+                "system",
+                "--recipient",
+                reviewer,
+                "--summary",
+                "review-round-trigger",
+                "--content",
+                reviewer_prompt,
+            ],
+        )
 
 
 def worker_online(bus_path: Path, db_path: Path, fs_path: Path, worker: WorkerState) -> None:
@@ -479,11 +604,13 @@ def publish_worker_result(
 ) -> None:
     summary = agent_loop.summarize_output(run_out, limit=220) or "empty output"
     kind = "status" if exit_code == 0 else "blocker"
-    body = (
-        f"processed prompt exit={exit_code} summary={summary}"
-        if exit_code == 0
-        else f"codex exec failed exit={exit_code} summary={summary}"
-    )
+    state = "complete" if exit_code == 0 else "failed"
+    result_label = "worker_result"
+    summary_tag = "worker-run-complete" if exit_code == 0 else "worker-run-failed"
+    if worker.args.role == "reviewer":
+        result_label = "reviewer_result"
+        summary_tag = "reviewer-run-complete" if exit_code == 0 else "reviewer-run-failed"
+    body = f"{result_label} state={state} exit={exit_code} summary={summary}"
     if worker.args.agent != lead:
         bus_cmd(
             bus_path,
@@ -509,7 +636,13 @@ def publish_worker_result(
             sender=worker.args.agent,
             recipient=lead,
             content=body,
-            summary="work-update" if exit_code == 0 else "work-blocker",
+            summary=summary_tag,
+            meta={
+                "source": "worker-result",
+                "worker": worker.args.agent,
+                "state": state,
+                "exit_code": exit_code,
+            },
         )
 
     agent_loop.emit_collaboration_updates(
@@ -582,8 +715,8 @@ def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None
     if proc.poll() is None:
         try:
             proc.terminate()
-        except Exception:
-            pass
+        except Exception as exc:
+            append_lifecycle(args.lifecycle_log, f"config-refresh-failed error={exc}")
         deadline = time.time() + timeout_sec
         while proc.poll() is None and time.time() < deadline:
             time.sleep(0.1)
@@ -600,6 +733,7 @@ def terminate_worker_proc(worker: WorkerState, timeout_sec: float = 5.0) -> None
 
 
 def main() -> int:
+    global HUB_LIFECYCLE_LOG
     parser = argparse.ArgumentParser(description="codex-teams shared in-process hub")
     parser.add_argument("--repo", required=True)
     parser.add_argument("--session", required=True)
@@ -614,6 +748,10 @@ def main() -> int:
     parser.add_argument("--lead-cwd", default="")
     parser.add_argument("--lead-profile", default="")
     parser.add_argument("--lead-model", default="")
+    parser.add_argument("--reviewer-name", default="reviewer-1")
+    parser.add_argument("--reviewer-profile", default="")
+    parser.add_argument("--reviewer-model", default="")
+    parser.add_argument("--reviewer-permission-mode", default="plan")
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument("--poll-ms", type=int, default=1000)
     parser.add_argument("--idle-ms", type=int, default=12000)
@@ -622,19 +760,20 @@ def main() -> int:
     parser.add_argument("--heartbeat-file", default="")
     parser.add_argument("--lifecycle-log", default="")
     args = parser.parse_args()
+    HUB_LIFECYCLE_LOG = args.lifecycle_log
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
     fs_path = SCRIPT_DIR / "team_fs.py"
     bus_path = SCRIPT_DIR / "team_bus.py"
-    db_path = Path(args.repo).resolve() / ".codex-teams" / args.session / "bus.sqlite"
+    paths = team_fs.resolve_paths(args.repo, args.session)
+    db_path = paths.root / "bus.sqlite"
     append_lifecycle(
         args.lifecycle_log,
         f"hub-start pid={os.getpid()} repo={Path(args.repo).resolve()} session={args.session} room={args.room}",
     )
 
-    paths = team_fs.resolve_paths(args.repo, args.session)
     cfg = team_fs.read_config(paths)
     lead = args.lead_name.strip() or team_fs.lead_name(cfg)
     lead_cwd = str(Path(args.lead_cwd).resolve()) if args.lead_cwd.strip() else str(Path(args.repo).resolve())
@@ -650,14 +789,22 @@ def main() -> int:
             worker_names.append(f"{args.prefix}-{i}")
 
     for name in worker_names:
+        role = role_from_agent_name(name, lead_name=lead, reviewer_name=args.reviewer_name)
         if name == lead:
             cwd = lead_cwd
             profile = lead_profile
             model = lead_model
+            permission_mode = args.permission_mode
+        elif role == "reviewer":
+            cwd = lead_cwd
+            profile = args.reviewer_profile.strip() or args.profile
+            model = args.reviewer_model.strip() or args.model
+            permission_mode = args.reviewer_permission_mode.strip() or "plan"
         else:
             cwd = str((worktrees_root / name).resolve())
             profile = args.profile
             model = args.model
+            permission_mode = args.permission_mode
         if not Path(cwd).is_dir():
             bus_cmd(
                 bus_path,
@@ -682,14 +829,14 @@ def main() -> int:
             session=args.session,
             room=args.room,
             agent=name,
-            role=role_from_agent_name(name, lead_name=lead),
+            role=role,
             cwd=cwd,
             profile=profile,
             model=model,
             codex_bin=args.codex_bin,
             poll_ms=args.poll_ms,
             idle_ms=args.idle_ms,
-            permission_mode=args.permission_mode,
+            permission_mode=permission_mode,
             plan_mode_required=bool(args.plan_mode_required),
         )
         workers.append(
@@ -761,6 +908,7 @@ def main() -> int:
     worker_done: dict[str, bool] = {
         worker.args.agent: False for worker in workers if worker.args.role == "worker"
     }
+    reviewer_names = [worker.args.agent for worker in workers if worker.args.role == "reviewer"]
     review_ready_announced = False
     lead_last_mention_token = 0
     lead_last_scanned_index = 0
@@ -856,18 +1004,27 @@ def main() -> int:
                     terminate_worker_proc(worker)
                     worker.stopped = True
                     worker_offline(bus_path, db_path, fs_path, worker)
+                    if worker.args.role == "worker":
+                        worker_done[worker.args.agent] = False
+                        review_ready_announced = False
                     did_work = True
                     continue
 
                 for msg in work_messages:
                     idx = msg.get("index")
                     msg_index = idx if isinstance(idx, int) and idx >= 0 else None
+                    if msg_index is not None and worker_index_inflight(worker, msg_index):
+                        # Keep unread until current in-flight handling completes.
+                        continue
                     text = str(msg.get("text", "")).strip()
                     summary = str(msg.get("summary", "")).strip()
                     sender = str(msg.get("from", ""))
                     if text:
                         worker.pending_texts.append(f"from={sender} summary={summary} text={text}".strip())
-                        worker.pending_indexes.append(msg_index if msg_index is not None else -1)
+                        indexed_msg = msg_index if msg_index is not None else -1
+                        worker.pending_indexes.append(indexed_msg)
+                        if msg_index is not None:
+                            worker.pending_index_set.add(msg_index)
                     elif msg_index is not None:
                         immediate_ack_indexes.append(msg_index)
                 agent_loop.merge_collaboration_targets(
@@ -901,11 +1058,14 @@ def main() -> int:
                         run_out=err,
                     )
                     mark_worker_indexes_read(paths, worker, prompt_indexes)
+                    if worker.args.role == "worker":
+                        worker_done[worker.args.agent] = False
+                        review_ready_announced = False
                 else:
                     worker.active_proc = proc
                     worker.active_started_ms = now_ms()
                     worker.last_activity = worker.active_started_ms
-                    worker.active_indexes = prompt_indexes
+                    worker.active_indexes = [idx for idx in prompt_indexes if isinstance(idx, int) and idx >= 0]
                     reset_worker_output_capture(worker)
                     if worker.args.role == "worker":
                         worker_done[worker.args.agent] = False
@@ -930,8 +1090,21 @@ def main() -> int:
                         exit_code=exit_code,
                         run_out=run_out,
                     )
-                    mark_worker_indexes_read(paths, worker, worker.active_indexes)
+                    ack_ok = mark_worker_indexes_read(paths, worker, worker.active_indexes)
                     worker.active_indexes = []
+                    if worker.args.role == "worker":
+                        no_unread = not has_unread_messages(paths, worker.args.agent)
+                        worker_done[worker.args.agent] = bool(
+                            exit_code == 0
+                            and not worker.pending_texts
+                            and not worker.pending_indexes
+                            and not worker.pending_index_set
+                            and ack_ok
+                            and no_unread
+                        )
+                        if not no_unread:
+                            worker.force_mailbox_check = True
+                        review_ready_announced = False
                     did_work = True
 
             current = now_ms()
@@ -979,26 +1152,52 @@ def main() -> int:
             lead_rows = load_unread_messages_no_mark(
                 paths,
                 lead,
-                limit=LEAD_DONE_SCAN_BATCH,
+                limit=LEAD_MAILBOX_SCAN_BATCH,
                 start_index=lead_last_scanned_index,
             )
+            if not lead_rows and lead_last_scanned_index > 0:
+                oldest_lead = load_unread_messages_no_mark(
+                    paths,
+                    lead,
+                    limit=1,
+                    start_index=0,
+                )
+                if oldest_lead:
+                    oldest_idx = oldest_lead[0].get("index")
+                    if isinstance(oldest_idx, int) and 0 <= oldest_idx < lead_last_scanned_index:
+                        lead_last_scanned_index = oldest_idx
+                        lead_rows = load_unread_messages_no_mark(
+                            paths,
+                            lead,
+                            limit=LEAD_MAILBOX_SCAN_BATCH,
+                            start_index=lead_last_scanned_index,
+                        )
             for row in lead_rows:
                 idx = row.get("index")
-                if not isinstance(idx, int) or idx < 0:
-                    continue
-                if idx >= lead_last_scanned_index:
+                if isinstance(idx, int) and idx >= lead_last_scanned_index:
                     lead_last_scanned_index = idx + 1
+
                 sender = str(row.get("from", "")).strip()
                 if sender not in worker_done:
                     continue
-                if worker_message_reports_done(row):
-                    worker_done[sender] = True
-                    review_ready_announced = False
+
+                msg_type = str(row.get("type", "")).strip()
+                summary = str(row.get("summary", "")).strip().lower()
+                meta = agent_loop.parse_meta(row.get("meta"))
+                source = str(meta.get("source", "")).strip().lower()
+                if source == "worker-result":
                     continue
-                if agent_loop.is_actionable_work_message(row):
+                if source == "collab-update" and summary.startswith("peer-"):
+                    continue
+
+                if msg_type in {"question", "blocker", "task", "shutdown_request"}:
                     worker_done[sender] = False
                     review_ready_announced = False
-            force_lead_scan = bool(LEAD_DONE_SCAN_BATCH > 0 and len(lead_rows) >= LEAD_DONE_SCAN_BATCH)
+                elif msg_type == "message" and summary not in {"worker-run-complete", "worker-run-failed"}:
+                    worker_done[sender] = False
+                    review_ready_announced = False
+
+            force_lead_scan = bool(LEAD_MAILBOX_SCAN_BATCH > 0 and len(lead_rows) >= LEAD_MAILBOX_SCAN_BATCH)
             if not force_lead_scan:
                 lead_last_mention_token = lead_mention_token
             if lead_rows:
@@ -1013,6 +1212,7 @@ def main() -> int:
                 session=args.session,
                 room=args.room,
                 lead=lead,
+                reviewers=reviewer_names,
                 worker_done=worker_done,
             )
             review_ready_announced = True

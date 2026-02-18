@@ -9,7 +9,7 @@ Resolution order (highest first):
 
 Supported roles:
 - director, lead
-- worker, utility
+- worker, reviewer, utility
 
 Project config (.codex/config.toml) overrides user config (~/.codex/config.toml).
 """
@@ -68,7 +68,7 @@ def main() -> int:
     parser.add_argument("--profile", default=None)
     parser.add_argument(
         "--role",
-        choices=["director", "lead", "worker", "utility"],
+        choices=["director", "lead", "worker", "reviewer", "utility"],
         default=None,
     )
     parser.add_argument("--print-source", action="store_true", help="print source file with model")
