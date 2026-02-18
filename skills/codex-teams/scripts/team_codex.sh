@@ -660,8 +660,8 @@ validate_session_name() {
 }
 
 is_teams_enabled() {
-  local feature_flag="${CODEX_EXPERIMENTAL_AGENT_TEAMS:-${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-1}}"
-  local gate_flag="${CODEX_TEAMS_GATE_TENGU_AMBER_FLINT:-${CLAUDE_CODE_STATSIG_TENGU_AMBER_FLINT:-1}}"
+  local feature_flag="${CODEX_EXPERIMENTAL_AGENT_TEAMS:-${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}}"
+  local gate_flag="${CODEX_TEAMS_GATE_TENGU_AMBER_FLINT:-${CLAUDE_CODE_STATSIG_TENGU_AMBER_FLINT:-}}"
   parse_bool_env "$feature_flag" && parse_bool_env "$gate_flag"
 }
 

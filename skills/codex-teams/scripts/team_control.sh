@@ -10,6 +10,27 @@ ROOM="main"
 REPO=""
 SESSION=""
 
+validate_session_name() {
+  local raw="${1:-}"
+  if [[ -z "$raw" ]]; then
+    echo "session is required" >&2
+    exit 1
+  fi
+  if [[ "$raw" == *"/"* || "$raw" == *"\\"* ]]; then
+    echo "invalid session name '$raw' (path separators are not allowed)" >&2
+    exit 1
+  fi
+  if [[ "$raw" == "." || "$raw" == ".." || "$raw" == *".."* ]]; then
+    echo "invalid session name '$raw'" >&2
+    exit 1
+  fi
+  if ! [[ "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "invalid session name '$raw' (allowed: [A-Za-z0-9._-], max 128, starts with alnum)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$raw"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -52,6 +73,9 @@ done
 
 if [[ -n "$REPO" ]]; then
   REPO="$(cd "$REPO" && pwd)"
+fi
+if [[ -n "$SESSION" ]]; then
+  SESSION="$(validate_session_name "$SESSION")"
 fi
 if [[ -z "$DB" && -n "$REPO" && -n "$SESSION" ]]; then
   DB="$REPO/.codex-teams/$SESSION/bus.sqlite"
@@ -103,11 +127,8 @@ import uuid
 print(uuid.uuid4().hex[:12])
 PY
 )"
-    if [[ -n "$DB" ]]; then
-      out="$(python3 "$BUS" --db "$DB" control-request --room "$ROOM" --type "$req_type" --from "$sender" --to "$recipient" --body "$body" --summary "$summary" --request-id "$request_id")"
-      printf '%s\n' "$out"
-    fi
-
+    request_printed="false"
+    fs_persisted="false"
     if [[ -n "$REPO" && -n "$SESSION" ]]; then
       python3 "$FS" control-request \
         --repo "$REPO" \
@@ -118,9 +139,23 @@ PY
         --body "$body" \
         --summary "$summary" \
         --request-id "$request_id" >/dev/null
+      fs_persisted="true"
+    fi
+    if [[ -n "$DB" ]]; then
+      if out="$(python3 "$BUS" --db "$DB" control-request --room "$ROOM" --type "$req_type" --from "$sender" --to "$recipient" --body "$body" --summary "$summary" --request-id "$request_id" 2>/dev/null)"; then
+        if [[ -n "$out" ]]; then
+          printf '%s\n' "$out"
+          request_printed="true"
+        fi
+      elif [[ "$fs_persisted" == "true" ]]; then
+        echo "warn: bus control request persistence failed request_id=$request_id type=$req_type (fs persisted)" >&2
+      else
+        echo "failed to persist control request to db" >&2
+        exit 1
+      fi
     fi
 
-    if [[ -z "$DB" ]]; then
+    if [[ "$request_printed" != "true" ]]; then
       echo "request_id=$request_id"
     fi
     ;;
@@ -164,27 +199,34 @@ PY
     [[ -z "$body" ]] && body="$decision"
 
     req_type=""
+    req_sender=""
     if [[ -n "$DB" ]]; then
       if [[ "$decision" == "approve" ]]; then
-        out="$(python3 "$BUS" --db "$DB" control-respond --request-id "$req_id" --from "$sender" --approve --body "$body")"
+        bus_args=(--db "$DB" control-respond --request-id "$req_id" --from "$sender" --approve --body "$body")
       else
-        out="$(python3 "$BUS" --db "$DB" control-respond --request-id "$req_id" --from "$sender" --reject --body "$body")"
+        bus_args=(--db "$DB" control-respond --request-id "$req_id" --from "$sender" --reject --body "$body")
       fi
-      printf '%s\n' "$out"
+      if out="$(python3 "$BUS" "${bus_args[@]}" 2>/dev/null)"; then
+        printf '%s\n' "$out"
+      elif [[ -n "$REPO" && -n "$SESSION" ]]; then
+        echo "warn: bus control response persistence failed request_id=$req_id (fs fallback)" >&2
+      else
+        echo "failed to persist control response to db" >&2
+        exit 1
+      fi
 
-      req_type="$(python3 - "$DB" "$req_id" <<'PY'
+      req_type_lookup=""
+      if req_type_lookup="$(python3 - "$DB" "$req_id" 2>/dev/null <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 row = conn.execute('select req_type from control_requests where request_id=?', (sys.argv[2],)).fetchone()
 print(row[0] if row else "")
 PY
-)"
-    fi
-
-    if [[ -n "$REPO" && -n "$SESSION" ]]; then
-      req_sender=""
-      if [[ -n "$DB" ]]; then
-        pair="$(python3 - "$DB" "$req_id" <<'PY'
+      )"; then
+        req_type="$req_type_lookup"
+      fi
+      pair_lookup=""
+      if pair_lookup="$(python3 - "$DB" "$req_id" 2>/dev/null <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 row = conn.execute('select sender, recipient from control_requests where request_id=?', (sys.argv[2],)).fetchone()
@@ -193,8 +235,41 @@ if row:
 else:
     print("|")
 PY
+      )"; then
+        req_sender="${pair_lookup%%|*}"
+      fi
+    fi
+
+    if [[ -n "$REPO" && -n "$SESSION" ]]; then
+      if [[ -z "$req_type" || -z "$req_sender" ]]; then
+        fs_fields="$(python3 - "$FS" "$REPO" "$SESSION" "$req_id" <<'PY'
+import json
+import subprocess
+import sys
+
+fs, repo, session, request_id = sys.argv[1:5]
+proc = subprocess.run(
+    [sys.executable, fs, "control-get", "--repo", repo, "--session", session, "--request-id", request_id, "--json"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    check=False,
+)
+if proc.returncode != 0 or not proc.stdout.strip():
+    print("|")
+    raise SystemExit(0)
+try:
+    req = json.loads(proc.stdout)
+except json.JSONDecodeError:
+    print("|")
+    raise SystemExit(0)
+print(f"{req.get('req_type','')}|{req.get('sender','')}")
+PY
 )"
-        req_sender="${pair%%|*}"
+        if [[ -n "$fs_fields" && "$fs_fields" != "|" ]]; then
+          [[ -z "$req_type" ]] && req_type="${fs_fields%%|*}"
+          [[ -z "$req_sender" ]] && req_sender="${fs_fields##*|}"
+        fi
       fi
       approve_flag="false"
       [[ "$decision" == "approve" ]] && approve_flag="true"

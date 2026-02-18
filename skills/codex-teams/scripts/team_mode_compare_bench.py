@@ -23,10 +23,48 @@ MOCK_CODEX = SCRIPT_DIR / "bench_mock_codex.py"
 
 WORKERS = ["worker-1", "worker-2", "worker-3"]
 VALID_MODES = {"in-process-shared"}
+WORKER_ACK_SUMMARIES = {"work-update", "worker-run-complete", "worker-run-failed"}
 
 
 class BenchError(RuntimeError):
     pass
+
+
+def is_worker_ack(msg: dict[str, Any], *, worker: str = "") -> bool:
+    sender = str(msg.get("from", "")).strip()
+    if worker and sender != worker:
+        return False
+    if not sender.startswith("worker-"):
+        return False
+
+    summary = str(msg.get("summary", "")).strip()
+    if summary in WORKER_ACK_SUMMARIES:
+        return True
+
+    meta = msg.get("meta")
+    if isinstance(meta, dict) and str(meta.get("source", "")).strip() == "worker-result":
+        return True
+
+    text = str(msg.get("text", "")).strip()
+    return "worker_result state=" in text
+
+
+def resolve_tmp_root() -> Path:
+    raw = os.environ.get("CODEX_BENCH_TMPDIR", "").strip() or os.environ.get("TMPDIR", "").strip()
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    candidates.append(SCRIPT_DIR.parents[2] / ".tmp")
+    candidates.append(Path.cwd() / ".tmp")
+
+    for candidate in candidates:
+        text = str(candidate)
+        if not text.startswith("/mnt/"):
+            continue
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    raise BenchError("benchmark tmp dir must be under /mnt/... (set CODEX_BENCH_TMPDIR)")
 
 
 def run_cmd(
@@ -183,11 +221,8 @@ def wait_for_worker_ack(
     while time.time() < deadline:
         unread = read_lead_unread(repo, session, env=env)
         for msg in unread:
-            if str(msg.get("from", "")).strip() != worker:
-                continue
-            if str(msg.get("summary", "")).strip() != "work-update":
-                continue
-            return time.time() - start
+            if is_worker_ack(msg, worker=worker):
+                return time.time() - start
         time.sleep(0.05)
     return None
 
@@ -205,12 +240,7 @@ def wait_for_burst_acks(
     observed = 0
     while time.time() < deadline:
         unread = read_lead_unread(repo, session, env=env)
-        observed = sum(
-            1
-            for msg in unread
-            if str(msg.get("summary", "")).strip() == "work-update"
-            and str(msg.get("from", "")).strip().startswith("worker-")
-        )
+        observed = sum(1 for msg in unread if is_worker_ack(msg))
         if observed >= expected:
             return time.time() - start, observed
         time.sleep(0.05)
@@ -240,11 +270,8 @@ def wait_for_worker_ack_with_sampling(
 
         unread = read_lead_unread(repo, session, env=env)
         for msg in unread:
-            if str(msg.get("from", "")).strip() != worker:
-                continue
-            if str(msg.get("summary", "")).strip() != "work-update":
-                continue
-            return time.time() - start
+            if is_worker_ack(msg, worker=worker):
+                return time.time() - start
         time.sleep(0.05)
     return None
 
@@ -298,11 +325,15 @@ def run_one_mode(
     if mode not in VALID_MODES:
         raise BenchError(f"unsupported mode: {mode}")
 
-    repo = Path(tempfile.mkdtemp(prefix=f"codex_mode_{mode.replace('-', '_')}_"))
+    tmp_root = resolve_tmp_root()
+
+    repo = Path(tempfile.mkdtemp(prefix=f"codex_mode_{mode.replace('-', '_')}_", dir=str(tmp_root)))
     session = f"bench-{mode.replace('-', '')}-{int(time.time() * 1000) % 1000000}"
 
     mode_env = dict(env)
     mode_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    mode_env["CODEX_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+    mode_env["CODEX_TEAMS_GATE_TENGU_AMBER_FLINT"] = "1"
     mode_env["CODEX_TEAMMATE_COMMAND"] = str(MOCK_CODEX)
     mode_env["CODEX_BENCH_REPO"] = str(repo)
     mode_env["CODEX_BENCH_SESSION"] = session

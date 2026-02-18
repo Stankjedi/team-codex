@@ -20,6 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TEAM_FS = SCRIPT_DIR / "team_fs.py"
 TEAM_BUS = SCRIPT_DIR / "team_bus.py"
 TEAM_HUB = SCRIPT_DIR / "team_inprocess_hub.py"
+WORKER_ACK_SUMMARIES = {"work-update", "worker-run-complete", "worker-run-failed"}
 
 
 def run_cmd(cmd: list[str], *, env: dict[str, str], check: bool = True, cwd: str | None = None) -> str:
@@ -86,6 +87,38 @@ def build_worker_names(workers: int) -> list[str]:
     return [f"worker-{i}" for i in range(1, workers + 1)]
 
 
+def is_worker_ack(msg: dict[str, object]) -> bool:
+    sender = str(msg.get("from", "")).strip()
+    if not sender.startswith("worker-"):
+        return False
+    summary = str(msg.get("summary", "")).strip()
+    if summary in WORKER_ACK_SUMMARIES:
+        return True
+    meta = msg.get("meta")
+    if isinstance(meta, dict) and str(meta.get("source", "")).strip() == "worker-result":
+        return True
+    text = str(msg.get("text", "")).strip()
+    return "worker_result state=" in text
+
+
+def resolve_tmp_root() -> Path:
+    raw = os.environ.get("CODEX_BENCH_TMPDIR", "").strip() or os.environ.get("TMPDIR", "").strip()
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    candidates.append(SCRIPT_DIR.parents[2] / ".tmp")
+    candidates.append(Path.cwd() / ".tmp")
+
+    for candidate in candidates:
+        text = str(candidate)
+        if not text.startswith("/mnt/"):
+            continue
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    raise SystemExit("benchmark tmp dir must be under /mnt/... (set CODEX_BENCH_TMPDIR)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="codex-teams soak benchmark (in-process-shared)")
     parser.add_argument("--workers", type=int, default=3)
@@ -114,8 +147,12 @@ def main() -> int:
 
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["CODEX_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+    env["CODEX_TEAMS_GATE_TENGU_AMBER_FLINT"] = "1"
 
-    temp_repo = Path(tempfile.mkdtemp(prefix="codex_teams_soak_"))
+    tmp_root = resolve_tmp_root()
+
+    temp_repo = Path(tempfile.mkdtemp(prefix="codex_teams_soak_", dir=str(tmp_root)))
     session = "soak-bench"
     worktrees = temp_repo / ".worktrees"
     worktrees.mkdir(parents=True, exist_ok=True)
@@ -319,7 +356,7 @@ def main() -> int:
 
         try:
             lead_unread = json.loads(lead_unread_out)
-            lead_work_updates = sum(1 for m in lead_unread if str(m.get("summary", "")) == "work-update")
+            lead_work_updates = sum(1 for m in lead_unread if isinstance(m, dict) and is_worker_ack(m))
         except json.JSONDecodeError:
             lead_work_updates = -1
 
