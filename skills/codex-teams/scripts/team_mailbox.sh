@@ -11,6 +11,27 @@ REPO=""
 SESSION=""
 MODE="auto"
 
+validate_session_name() {
+  local raw="${1:-}"
+  if [[ -z "$raw" ]]; then
+    echo "session is required" >&2
+    exit 1
+  fi
+  if [[ "$raw" == *"/"* || "$raw" == *"\\"* ]]; then
+    echo "invalid session name '$raw' (path separators are not allowed)" >&2
+    exit 1
+  fi
+  if [[ "$raw" == "." || "$raw" == ".." || "$raw" == *".."* ]]; then
+    echo "invalid session name '$raw'" >&2
+    exit 1
+  fi
+  if ! [[ "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "invalid session name '$raw' (allowed: [A-Za-z0-9._-], max 128, starts with alnum)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$raw"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -64,6 +85,9 @@ done
 if [[ -n "$REPO" ]]; then
   REPO="$(cd "$REPO" && pwd)"
 fi
+if [[ -n "$SESSION" ]]; then
+  SESSION="$(validate_session_name "$SESSION")"
+fi
 if [[ -z "$DB" && -n "$REPO" && -n "$SESSION" ]]; then
   DB="$REPO/.codex-teams/$SESSION/bus.sqlite"
 fi
@@ -107,7 +131,7 @@ require_fs() {
 
 case "$cmd" in
   register)
-    if [[ $# -lt 1 ]]; then
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
       usage
       exit 1
     fi
@@ -118,12 +142,15 @@ case "$cmd" in
     ;;
 
   members)
+    json_out="false"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --json) json_out="true"; shift ;;
+        *) echo "Unknown arg for members: $1" >&2; exit 1 ;;
+      esac
+    done
     if [[ "$MODE" == "fs" ]]; then
       require_fs
-      json_out="false"
-      if [[ "${1:-}" == "--json" ]]; then
-        json_out="true"
-      fi
       cfg_json="$(python3 "$FS" team-get --repo "$REPO" --session "$SESSION" --json)"
       TEAM_CFG_JSON="$cfg_json" python3 - "$json_out" <<'PY'
 import json
@@ -160,9 +187,7 @@ PY
     else
       require_db
       args=(--db "$DB" members --room "$ROOM")
-      if [[ "${1:-}" == "--json" ]]; then
-        args+=(--json)
-      fi
+      [[ "$json_out" == "true" ]] && args+=(--json)
       python3 "$BUS" "${args[@]}"
     fi
     ;;
@@ -262,6 +287,18 @@ PY
         *) echo "Unknown arg for mark-read: $1" >&2; exit 1 ;;
       esac
     done
+    if [[ -n "$up_to" && ! "$up_to" =~ ^[0-9]+$ ]]; then
+      echo "invalid --up-to '$up_to' (must be non-negative integer)" >&2
+      exit 1
+    fi
+    if [[ "${#ids[@]}" -gt 0 ]]; then
+      for id in "${ids[@]}"; do
+        if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+          echo "invalid --id '$id' (must be non-negative integer)" >&2
+          exit 1
+        fi
+      done
+    fi
 
     if [[ "$MODE" == "fs" ]]; then
       require_fs
